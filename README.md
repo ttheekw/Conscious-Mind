@@ -67,12 +67,12 @@ This is a comparison of designs, not a benchmark: neither was run side by side w
 | Success criteria per task | Written before, checked after, corrected by your response | Not described in its docs | Not described in its docs |
 | Scheduled runs | Yes: by time, or when a file changes | Yes (cron) | Yes (heartbeat, cron) |
 | Guardrails | Compiled policy, OS sandbox, hard budgets, stall check | Approval prompts and sandbox options | Approval prompts and sandbox options |
-| Connectors and channels | None, by choice | Many | Many |
+| Connectors and channels | A Telegram bot, and nothing else | Many | Many |
 | Memory you can edit by hand | No: one JSON graph, seen through the terminal UI | Yes, plain files | Yes, plain Markdown |
 | Offline fine-tuning from its own runs | No | Yes | Not described in its docs |
 | Maturity | Prototype, one developer | Released, large community | Released, large community |
 
-**Where they are ahead:** reach (messaging channels, connectors, MCP), maturity, memory you can open in an editor, and Hermes's path from its own runs to a fine-tuned model. `conscious` has none of those. Its exposure to outside input is smaller mostly because it does less.
+**Where they are ahead:** reach (many messaging channels, connectors, MCP), maturity, memory you can open in an editor, and Hermes's path from its own runs to a fine-tuned model. `conscious` has none of those. Its exposure to outside input is smaller mostly because it does less.
 
 **Where this is different:** they are assistants you message; `conscious` is meant to learn from its own results and change itself. Model routing that learns, criteria it checks itself against, limits that move with evidence, and gated rewriting of its policy and its source are the point of the project.
 
@@ -97,6 +97,8 @@ cd Conscious-Mind
 ```
 
 The script builds a release binary, copies it to `~/.local/bin/conscious`, and runs `conscious check`, which reports what your machine has and which model would be used. It never uses `sudo` and installs nothing else. The first build downloads the ONNX Runtime library and takes a few minutes. On first run, a small embedding model (about 65 MB) is downloaded to `~/.cache/conscious/models`; it runs locally and nothing you embed leaves your machine.
+
+**The first start checks that a model really answers.** `conscious` brings no model of its own: it works through Claude Code or Codex (or a running local server, or an OpenAI / OpenRouter model you name). The first time you run it, it says so, shows what it found on your machine, and sends one small request to make sure the model answers, before anything else starts. If none does, it stops and tells you how to sign in.
 
 `PREFIX=/some/dir ./install.sh` installs elsewhere. `./install.sh --uninstall` removes the command and keeps your data.
 
@@ -125,6 +127,7 @@ That one command starts everything: it starts a background process if none is ru
 | `a` / `d` | Accept / deny a call that is waiting for you. |
 | `+` / `-` | Rate the result. Routing, skills and lessons learn from it. |
 | `m` | Open a memory. The marks on the map are clickable too. |
+| `K` | Type a secret (a key or token) into its own window. |
 | `X` | Stop what the open tab is doing. |
 | `?` | Help. |
 
@@ -143,6 +146,26 @@ conscious --help           # everything else
 ```
 
 Your data (memory, timeline, skills, policy versions) is in `~/.local/share/conscious`.
+
+### Secrets
+
+Keys, tokens and passwords never go to a model. Press `K` and type one into its own window: the value is drawn only as dots, goes straight to a store on your machine, and is never written to the timeline or put in anything a model reads. When the agent needs one it does not have, the window opens by itself, saying what it is for.
+
+The agent knows a secret only by its name. It uses one by writing `$NAME` in a shell command; conscious puts the value in that command's environment, asks you first every time, and removes the value from the output the model gets back. `conscious secrets` lists the names you have stored, and `conscious secrets remove NAME` forgets one.
+
+An `OPENAI_API_KEY` or `OPENROUTER_API_KEY` entered this way is used for that backend, so you do not need to export it.
+
+### Telegram
+
+You can talk to the main conversation from Telegram.
+
+1. In Telegram, message [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the token it gives you.
+2. In conscious, press `K`, name the secret `TELEGRAM_BOT_TOKEN`, and paste the token as its value.
+3. conscious shows a line such as `/pair 482913`. Send exactly that to your bot from your own Telegram account.
+
+From then on, what you send the bot is said to main, and main's replies and the results of its branches come back to you there. Only the account that sent the pairing code is heard; group chats are ignored. Nothing can be approved and no secret can be entered from Telegram: those wait for you at the screen, and the bot only tells you something is waiting. While a bot is connected, the background process keeps running.
+
+What main says to you over Telegram passes through Telegram's servers.
 
 ## Safety
 
@@ -164,7 +187,11 @@ This is a prototype that runs shell commands on your machine. Use it in folders 
 - MCP, connectors and messaging channels.
 - Starting at login: after a reboot nothing runs until you start it once.
 - The Codex backend is untested with tools; Claude Code is the backend it has been exercised with.
-- No licence has been chosen yet.
+- Secrets are kept as a plain file readable only by you, not in the system keyring.
+
+## Licence
+
+[MIT](LICENSE).
 
 ## For contributors and coding agents
 

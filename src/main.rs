@@ -16,10 +16,12 @@ mod provider;
 mod research;
 mod router;
 mod schedule;
+mod secrets;
 mod selfupdate;
 mod skills;
 #[cfg(test)]
 mod snapshot;
+mod telegram;
 mod theme;
 mod timeline;
 mod tools;
@@ -72,6 +74,7 @@ conscious --no-criteria            do not set success criteria for each task (sa
 conscious --no-self-update         never let it change its own source code
 conscious selfupdate               what it has tried to change in its own code, and what came of each
 conscious selfupdate rollback      take the newest adopted change to its own code back
+conscious secrets [remove NAME]    the names of the secrets you have stored (enter one with K in the TUI)
 conscious skills                   the procedures the agent has written for itself
 conscious lessons                  the lessons it has drawn, whether each is confirmed, and how it has fared
 conscious tuning                   the limits on what it learns: what each is now, and why it moved
@@ -294,6 +297,9 @@ fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().is_some_and(|a| a == "knowledge") {
         return knowledge::cli::run(&raw[1..]);
+    }
+    if raw.first().is_some_and(|a| a == "secrets") {
+        return secrets_command(&raw[1..]);
     }
     if raw.first().is_some_and(|a| a == "skills") {
         match skills::Skills::default_dir() {
@@ -684,6 +690,11 @@ fn screen(args: &Args, path: &std::path::Path) -> ExitCode {
             );
             return ExitCode::from(2);
         };
+        // The very first start checks, in view, that a model answers.
+        let spec = match first_run(&report, spec) {
+            Ok(spec) => spec,
+            Err(code) => return code,
+        };
         let mut pass = vec!["--model".to_string(), spec];
         if !args.route {
             pass.push("--no-route".into());
@@ -864,6 +875,84 @@ fn stop_command(rest: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// `conscious secrets` lists the names of the stored secrets, never their
+/// values; `remove NAME` forgets one. Secrets are entered in the TUI (K),
+/// not here, so that they are never typed into a shell history.
+fn secrets_command(args: &[String]) -> ExitCode {
+    let mut store = secrets::store().lock().unwrap();
+    match args {
+        [] => {
+            let names = store.names();
+            if names.is_empty() {
+                println!(
+                    "No secrets are stored. In conscious, press K to type one into its own window."
+                );
+            } else {
+                println!("Stored secrets (names only; values are never shown):");
+                for name in names {
+                    println!("  {name}");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        [action, name] if action == "remove" => match store.remove(name) {
+            Ok(true) => {
+                println!(
+                    "Removed {name}. If conscious is running in the background, run \
+                     `conscious stop` so that it forgets it too."
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                eprintln!("error: there is no secret called {name}");
+                ExitCode::FAILURE
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        _ => {
+            eprintln!("usage: conscious secrets [remove NAME]");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The check a first start makes, in view, before anything is started:
+/// says what conscious works through, shows what this machine has, and
+/// sends one small real request to make sure a model really answers
+/// (being signed in does not show a used-up allowance). The backends are
+/// tried in a fixed order; the first that answers is the core. Returns
+/// that core, or the exit code to stop with.
+fn first_run(report: &preflight::Report, chosen: String) -> Result<String, ExitCode> {
+    let Some(marker) = preflight::first_run_marker() else {
+        return Ok(chosen);
+    };
+    if marker.exists() {
+        return Ok(chosen);
+    }
+    println!("{}", report.welcome());
+    for spec in report.first_run_order() {
+        println!("Asking {spec} for a one-word reply, to see that it really answers...");
+        match preflight::call(&spec) {
+            Ok(how) => {
+                println!("ok    {how}\n");
+                let _ = std::fs::write(&marker, format!("{spec}\n"));
+                return Ok(spec);
+            }
+            Err(why) => println!("FAIL  {spec}: {why}\n"),
+        }
+    }
+    eprintln!(
+        "error: no model answered, so conscious cannot start.\n\
+         Sign in to Claude Code (run `claude`) or Codex (run `codex login`), then run \
+         conscious again.\n\
+         `conscious check --call` repeats this check; `conscious --demo` runs without a model."
+    );
+    Err(ExitCode::from(2))
 }
 
 /// `conscious schedule` lists the scheduled jobs; `cancel ID` removes one.

@@ -241,6 +241,89 @@ fn the_map_shows_real_memories_and_a_click_opens_one() {
 }
 
 #[test]
+fn a_secret_is_typed_into_its_own_window_and_never_drawn() {
+    use crate::event::EventKind as E;
+    let mut app = App::new(false);
+    // K opens the window; what is typed goes to it and nowhere else.
+    key(&mut app, KeyCode::Char('K'));
+    for c in "github_token".chars() {
+        key(&mut app, KeyCode::Char(c));
+    }
+    key(&mut app, KeyCode::Tab);
+    for c in "ghx-very-secret-value".chars() {
+        key(&mut app, KeyCode::Char(c));
+    }
+    let screen = text(&render(&mut app));
+    for expected in [
+        "SECRET",
+        "GITHUB_TOKEN",
+        "•",
+        "(21 characters)",
+        "never sent to a model",
+    ] {
+        assert!(
+            screen.contains(expected),
+            "missing {expected:?} in:\n{screen}"
+        );
+    }
+    assert!(!screen.contains("very-secret"), "{screen}");
+    assert!(app.input.is_empty());
+    // q, a, d and the rest are letters here, not commands.
+    assert!(!app.quit);
+
+    // Enter sends it to the store, and to nothing else on the screen.
+    key(&mut app, KeyCode::Enter);
+    assert!(app.secret_form.is_none());
+    assert!(matches!(
+        &app.outbox[..],
+        [Command::Secret { name, value: Some(v) }]
+            if name == "GITHUB_TOKEN" && v.0 == "ghx-very-secret-value"
+    ));
+    assert!(!format!("{:?}", app.outbox).contains("very-secret"));
+    assert!(!format!("{:?}", app.events).contains("very-secret"));
+    assert!(!text(&render(&mut app)).contains("very-secret"));
+
+    // A name that could not be a secret's is refused in the window.
+    key(&mut app, KeyCode::Char('K'));
+    key(&mut app, KeyCode::Char('9'));
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('x'));
+    key(&mut app, KeyCode::Enter);
+    assert!(text(&render(&mut app)).contains("a secret's name is capitals"));
+    key(&mut app, KeyCode::Esc);
+    assert!(app.secret_form.is_none());
+    assert_eq!(app.outbox.len(), 1, "cancelling one's own sends nothing");
+
+    // When the agent asks, the window opens by itself with the name set;
+    // leaving it tells the agent the secret was not given.
+    app.apply_in(
+        Some(1),
+        E::SecretAsked {
+            name: "DEPLOY_KEY".into(),
+            why: "to publish the package".into(),
+        },
+    );
+    let screen = text(&render(&mut app));
+    assert!(screen.contains("DEPLOY_KEY"), "{screen}");
+    assert!(screen.contains("to publish the package"), "{screen}");
+    key(&mut app, KeyCode::Esc);
+    assert!(matches!(
+        &app.outbox[1],
+        Command::Secret { name, value: None } if name == "DEPLOY_KEY"
+    ));
+    // One asked for in an earlier session does not open a window now.
+    app.restore(vec![crate::timeline::Recorded {
+        wall: 1_794_579_000,
+        task: Some(1),
+        kind: E::SecretAsked {
+            name: "OLD_KEY".into(),
+            why: String::new(),
+        },
+    }]);
+    assert!(app.secret_form.is_none());
+}
+
+#[test]
 fn clicking_a_tool_row_opens_its_details() {
     let (mut app, _demo) = at_gate();
     key(&mut app, KeyCode::Esc);

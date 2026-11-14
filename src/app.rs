@@ -78,6 +78,21 @@ pub struct Agent {
     pub tokens: u64,
 }
 
+/// The window a secret is typed into.
+#[derive(Clone, Debug, Default)]
+pub struct SecretForm {
+    pub name: String,
+    pub value: String,
+    /// What the agent said it is for, when the agent asked.
+    pub why: String,
+    /// Whether the agent asked for it (the name is then fixed, and closing
+    /// the window tells the agent it was not given).
+    pub asked: bool,
+    /// Which of the two fields is being typed into.
+    pub on_value: bool,
+    pub error: String,
+}
+
 /// One task as the screen tracks it: a tab.
 #[derive(Clone, Debug)]
 pub struct TaskView {
@@ -227,6 +242,12 @@ pub struct App {
     pub main_seen: bool,
     /// The reply each task is writing right now, as far as it has come.
     pub drafts: Vec<(TaskId, String)>,
+    /// The window a secret is typed into, when it is open. What is typed
+    /// there is held here only until it is sent to the secret store: it is
+    /// never put in the input line, an event or the timeline.
+    pub secret_form: Option<SecretForm>,
+    /// Set while earlier sessions' events are being put back on screen.
+    pub restoring: bool,
     /// Whether branches that have ended are listed too. Off to begin with:
     /// what they found is merged into main, so only work in hand is shown.
     pub show_ended: bool,
@@ -306,6 +327,8 @@ impl App {
             main_seen: false,
             drafts: Vec::new(),
             show_ended: false,
+            secret_form: None,
+            restoring: false,
             input_task: None,
             live: false,
             goal: None,
@@ -379,6 +402,69 @@ impl App {
 
     pub fn context_used(&self) -> u32 {
         self.context.iter().map(|s| s.tokens).sum()
+    }
+
+    /// A key pressed while the secret window is open. Everything typed
+    /// goes to the window and nowhere else.
+    fn secret_key(&mut self, k: KeyEvent) {
+        let Some(form) = &mut self.secret_form else {
+            return;
+        };
+        match k.code {
+            // Closing it without a value tells a waiting agent "no".
+            KeyCode::Esc => {
+                if form.asked {
+                    self.outbox.push(Command::Secret {
+                        name: form.name.clone(),
+                        value: None,
+                    });
+                }
+                self.secret_form = None;
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                if !form.asked {
+                    form.on_value = !form.on_value;
+                }
+            }
+            KeyCode::Enter => {
+                if !form.on_value {
+                    form.on_value = true;
+                    return;
+                }
+                if let Err(why) = crate::secrets::valid_name(&form.name) {
+                    form.error = why;
+                    form.on_value = false;
+                    return;
+                }
+                if form.value.trim().is_empty() {
+                    form.error = "type the secret's value, or press esc to leave".into();
+                    return;
+                }
+                self.outbox.push(Command::Secret {
+                    name: form.name.clone(),
+                    value: Some(crate::secrets::Hidden(std::mem::take(&mut form.value))),
+                });
+                self.secret_form = None;
+            }
+            KeyCode::Backspace => {
+                form.error.clear();
+                if form.on_value {
+                    form.value.pop();
+                } else {
+                    form.name.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                form.error.clear();
+                if form.on_value {
+                    form.value.push(c);
+                } else {
+                    // Names are capitals: typed in lower case, they are raised.
+                    form.name.push(c.to_ascii_uppercase());
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The memories on the map, newest first: those not merged away.
@@ -691,6 +777,29 @@ impl App {
             }
         }
         match &kind {
+            // The agent asks for a secret: its window opens. (Not for one
+            // asked in an earlier session, whose task is gone.)
+            EventKind::SecretAsked { name, why } => {
+                if !self.restoring {
+                    self.secret_form = Some(SecretForm {
+                        name: name.clone(),
+                        value: String::new(),
+                        why: why.clone(),
+                        asked: true,
+                        on_value: true,
+                        error: String::new(),
+                    });
+                }
+            }
+            EventKind::SecretAnswered { name, .. } => {
+                if self
+                    .secret_form
+                    .as_ref()
+                    .is_some_and(|f| f.asked && f.name == *name)
+                {
+                    self.secret_form = None;
+                }
+            }
             EventKind::TaskOpened { .. }
             | EventKind::Merged { .. }
             | EventKind::TaskUpdate { .. }
@@ -919,6 +1028,12 @@ impl App {
     /// and counters continue instead of starting blank. Nothing in them is
     /// re-run; they only rebuild what is shown.
     pub fn restore(&mut self, recorded: Vec<crate::timeline::Recorded>) {
+        self.restoring = true;
+        self.restore_events(recorded);
+        self.restoring = false;
+    }
+
+    fn restore_events(&mut self, recorded: Vec<crate::timeline::Recorded>) {
         for r in recorded {
             // Start-of-session status lines and index loads describe a
             // session that is over; replaying them would only add clutter.
@@ -1196,6 +1311,10 @@ impl App {
             }
             return;
         }
+        if self.secret_form.is_some() {
+            self.secret_key(k);
+            return;
+        }
         if let Some(Modal::Memory(id)) = self.modal {
             match k.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.modal = None,
@@ -1255,6 +1374,10 @@ impl App {
             KeyCode::Char('3') => self.tab = Tab::Memory,
             KeyCode::Char('i') | KeyCode::Char(':') => self.start_input(false),
             KeyCode::Char('n') => self.start_input(true),
+            // A secret of the user's own choosing: its window opens empty.
+            KeyCode::Char('K') => {
+                self.secret_form = Some(SecretForm::default());
+            }
             // The newest memory; the arrows then step through the rest.
             KeyCode::Char('m') => {
                 if let Some(id) = self.shown_memories().first().map(|m| m.node.id) {
@@ -1345,6 +1468,10 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        // The secret window takes the keyboard and nothing else is live.
+        if self.secret_form.is_some() {
+            return;
+        }
         let (col, row) = (m.column, m.row);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {

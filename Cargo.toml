@@ -2,6 +2,9 @@
 name = "conscious"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "A self-learning agent harness: one conversation that keeps going, branches that merge back, and gated rewriting of its own code."
+repository = "https://github.com/ttheekw/Conscious-Mind"
 
 [dependencies]
 fastembed = { version = "7.7.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls", "onnx"] }

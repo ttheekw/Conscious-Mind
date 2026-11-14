@@ -34,6 +34,12 @@ pub enum Command {
     Stop {
         task: u32,
     },
+    /// A secret the user typed into its own window, or (`None`) their
+    /// refusal to give one that was asked for. Never an event.
+    Secret {
+        name: String,
+        value: Option<crate::secrets::Hidden>,
+    },
     Restart,
 }
 
@@ -417,6 +423,8 @@ impl Demo {
 
     pub fn handle(&mut self, cmd: Command) -> Vec<EventKind> {
         match cmd {
+            // The scripted demo keeps no secrets.
+            Command::Secret { .. } => Vec::new(),
             Command::Decide { id, approve } => {
                 let Some((tool, on_approve, on_deny)) = self.gate.take() else {
                     return Vec::new();

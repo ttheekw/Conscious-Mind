@@ -466,6 +466,98 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(m) = app.modal {
         render_modal(f, app, m, area);
     }
+    // Over everything else: nothing behind it takes a key while it is open.
+    if app.secret_form.is_some() {
+        render_secret_form(f, app, area);
+    }
+}
+
+/// The window a secret is typed into. The value is never drawn: only how
+/// many characters have been typed.
+fn render_secret_form(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(form) = app.secret_form.clone() else {
+        return;
+    };
+    let w = area.width.clamp(40, 84);
+    let h = 13.min(area.height);
+    let r = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w.min(area.width),
+        height: h,
+    };
+    app.hits.modal = Some(r);
+    f.render_widget(Clear, r);
+    let inner = hud(f, r, "SECRET", AMBER, true, None);
+    let iw = inner.width.saturating_sub(2) as usize;
+    let field = |label: &str, shown: String, active: bool| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {label:<6}"),
+                bold(if active { AMBER } else { DIM }),
+            ),
+            Span::styled(if active { "❯ " } else { "  " }, bold(AMBER)),
+            Span::styled(shown, if active { bold(TEXT) } else { fg(TEXT) }),
+            Span::styled(if active { "▌" } else { "" }, fg(AMBER)),
+        ])
+    };
+    let dots = form.value.chars().count();
+    let masked = if dots == 0 {
+        String::new()
+    } else {
+        format!("{} ({dots} characters)", "•".repeat(dots.min(24)))
+    };
+    let mut lines = vec![
+        Line::styled(
+            " Typed here, it goes straight to the secret store on this machine.",
+            fg(TEXT),
+        ),
+        Line::styled(
+            " It is never sent to a model, shown on screen or written to the timeline.",
+            fg(TEXT),
+        ),
+        Line::from(""),
+    ];
+    if form.asked {
+        for l in wrap(
+            &format!(
+                "The agent asks for it{}",
+                if form.why.is_empty() {
+                    ".".to_string()
+                } else {
+                    format!(": {}", form.why)
+                }
+            ),
+            iw,
+        )
+        .into_iter()
+        .take(2)
+        {
+            lines.push(Line::styled(format!(" {l}"), fg(DIM)));
+        }
+    } else {
+        lines.push(Line::styled(
+            " Name it in capitals, like GITHUB_TOKEN or TELEGRAM_BOT_TOKEN.",
+            fg(DIM),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(field("NAME", form.name.clone(), !form.on_value));
+    lines.push(field("VALUE", masked, form.on_value));
+    lines.push(Line::from(""));
+    lines.push(if form.error.is_empty() {
+        Line::styled(
+            if form.asked {
+                " ⏎ store it · esc do not give it"
+            } else {
+                " tab switch field · ⏎ store it · esc cancel"
+            },
+            fg(DIM),
+        )
+    } else {
+        Line::styled(format!(" {}", trunc(&form.error, iw)), bold(RED))
+    });
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ───────────────────────────── boot ─────────────────────────────
@@ -3308,6 +3400,7 @@ fn render_modal(f: &mut Frame, app: &mut App, modal: Modal, area: Rect) {
             let keys = [
                 ("tab / shift-tab", "move focus between panels"),
                 ("0", "main: the conversation that keeps going"),
+                ("K", "type a secret (a key or token) into its own window"),
                 ("b", "the branches: each one and where it stands"),
                 (
                     "e",

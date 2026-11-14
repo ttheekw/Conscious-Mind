@@ -462,6 +462,11 @@ impl Guard {
             "models" => {
                 Verdict::Allow("changes only which models this harness uses; easily undone".into())
             }
+            // Listing names tells nothing secret, and a request is put to
+            // the user, who answers it by typing the value or declining.
+            "secret" => Verdict::Allow(
+                "only names are shown; a value is typed by you, in its own window, and never reaches the model".into(),
+            ),
             // A branch only starts work in this same harness: every call it
             // makes is checked here like any other.
             "branch" => Verdict::Allow(
@@ -595,6 +600,28 @@ impl Guard {
         if let Some(bad) = FORBIDDEN.iter().find(|f| command.contains(*f)) {
             return Verdict::Deny(format!("`{}` is never run", bad.trim()));
         }
+        // Where the user's secrets are kept is never read by a command,
+        // not even one that only looks.
+        if command.contains("secrets.json") {
+            return Verdict::Deny(
+                "the file the user's secrets are kept in is never read or changed by a command"
+                    .into(),
+            );
+        }
+        // A command given one of the user's secrets is always the user's
+        // call, whatever the mode: the model cannot see the value, but the
+        // command can send it anywhere.
+        let secrets = crate::secrets::store().lock().unwrap().named_in(command);
+        if !secrets.is_empty() {
+            return Verdict::Ask {
+                risk: Risk::High,
+                reason: format!(
+                    "uses your secret{} {}: the value is given to this command, not to the model",
+                    if secrets.len() == 1 { "" } else { "s" },
+                    secrets.join(", ")
+                ),
+            };
+        }
         if read_only(command) {
             return Verdict::Allow("only reads".into());
         }
@@ -695,12 +722,24 @@ impl Guard {
     /// The process that runs a shell command: sandboxed when possible, with
     /// the network only if `network` is set (the user approved the command).
     pub fn shell(&self, command: &str, network: bool) -> Command {
+        // The secrets the command names are put in its environment, and
+        // only those. This is the one way a secret is ever used.
+        let secrets: Vec<(String, String)> = {
+            let store = crate::secrets::store().lock().unwrap();
+            store
+                .named_in(command)
+                .into_iter()
+                .filter_map(|name| Some((name.clone(), store.get(&name)?)))
+                .collect()
+        };
         if !self.sandbox {
             let mut cmd = Command::new("bash");
             cmd.arg("-c").arg(command).current_dir(&self.root);
+            cmd.envs(secrets);
             return cmd;
         }
         let mut cmd = Command::new("bwrap");
+        cmd.envs(secrets);
         cmd.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
             .args(["--tmpfs", "/tmp"]);
         let folders = self.folders();
@@ -710,6 +749,10 @@ impl Guard {
         // After the writable folders, so it wins if one of them contains it.
         for own in self.protected.iter().filter(|p| p.is_dir()) {
             cmd.arg("--ro-bind").arg(own).arg(own);
+        }
+        // The secrets file itself is not there for a sandboxed command.
+        if let Some(file) = crate::secrets::path().filter(|f| f.is_file()) {
+            cmd.arg("--ro-bind").arg("/dev/null").arg(file);
         }
         cmd.args(["--die-with-parent", "--new-session"]);
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -861,7 +904,8 @@ pub fn redact(text: &str) -> String {
         out.push_str(rest);
         kept.push(out);
     }
-    kept.join("\n")
+    // And the secrets the user gave the harness, by their own values.
+    crate::secrets::redact(&kept.join("\n"))
 }
 
 #[cfg(test)]
@@ -1299,6 +1343,48 @@ mod tests {
         }
         // Forbidden commands stay forbidden.
         assert!(matches!(shell(&g, "sudo make install"), Verdict::Deny(_)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_command_given_a_secret_always_asks_and_its_output_never_shows_the_value() {
+        let (g, root) = guard();
+        crate::secrets::store()
+            .lock()
+            .unwrap()
+            .set("GUARD_TEST_TOKEN", "tok-guard-0123456789")
+            .unwrap();
+        // Even a command that only reads, even in trusted mode.
+        assert!(g.manage_access("set_mode", "trusted").0);
+        for uses in ["echo $GUARD_TEST_TOKEN", "cat ${GUARD_TEST_TOKEN}.txt"] {
+            let verdict = shell(&g, uses);
+            assert!(
+                matches!(&verdict, Verdict::Ask { risk: Risk::High, reason } if reason.contains("GUARD_TEST_TOKEN")),
+                "{uses}: {verdict:?}"
+            );
+        }
+        // The reason names the secret, never its value.
+        if let Verdict::Ask { reason, .. } = shell(&g, "echo $GUARD_TEST_TOKEN") {
+            assert!(!reason.contains("tok-guard"));
+        }
+        // The file they are kept in is out of reach of any command.
+        assert!(matches!(
+            shell(&g, "cat ~/.local/share/conscious/secrets.json"),
+            Verdict::Deny(_)
+        ));
+        // The command is given the value in its environment...
+        let cmd = g.shell("echo $GUARD_TEST_TOKEN", false);
+        assert!(cmd.get_envs().any(
+            |(k, v)| k == "GUARD_TEST_TOKEN" && v.is_some_and(|v| v == "tok-guard-0123456789")
+        ));
+        // ...and one that does not name it is not.
+        let cmd = g.shell("echo hello", false);
+        assert!(!cmd.get_envs().any(|(k, _)| k == "GUARD_TEST_TOKEN"));
+        // What comes back is cleaned of it before anything else sees it.
+        assert_eq!(
+            redact("the token is tok-guard-0123456789."),
+            "the token is [secret GUARD_TEST_TOKEN]."
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

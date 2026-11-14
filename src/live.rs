@@ -129,6 +129,38 @@ enum Update {
     SkillsUsed(Vec<String>),
 }
 
+/// The connection to a Telegram bot: what it has heard comes in on one
+/// channel, what is to be sent goes out on another, each with a thread of
+/// its own, so the feed never waits on the network.
+struct Bridge {
+    pairing: crate::telegram::Pairing,
+    /// Where the pairing is saved, if anywhere.
+    path: Option<std::path::PathBuf>,
+    /// The code that makes whoever sends it the bot's owner.
+    code: String,
+    heard: Receiver<crate::telegram::Incoming>,
+    out: Sender<(i64, String)>,
+    /// Cleared when the bridge goes, so its reader thread ends.
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Bridge {
+    fn save(&self) {
+        if let (Some(path), Ok(text)) = (&self.path, serde_json::to_string_pretty(&self.pairing)) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
+
+/// Who is waiting for a secret to be typed: (task, name, where to answer).
+type SecretWaiters = Arc<Mutex<Vec<(u32, String, Sender<bool>)>>>;
+
 /// Where a worker thread reports to: the feed, with the task it works for.
 #[derive(Clone)]
 struct Out {
@@ -244,6 +276,11 @@ pub struct Live {
     updating: bool,
     /// Whether a message is shown before its context is assembled.
     echo_first: bool,
+    /// Tasks waiting for the user to type a secret: (task, the secret's
+    /// name, where the answer goes).
+    secret_waiters: SecretWaiters,
+    /// The Telegram bot the main conversation can also be reached by.
+    telegram: Option<Bridge>,
     /// Set when a self-update was adopted: the harness should restart into
     /// the new build once nothing is running. Says which update.
     restart: Option<String>,
@@ -413,6 +450,8 @@ impl Live {
             self_update: false,
             updating: false,
             echo_first: false,
+            secret_waiters: Arc::default(),
+            telegram: None,
             restart: None,
             update_dirs: None,
             idle_since: None,
@@ -1316,6 +1355,12 @@ impl Live {
                 }
             }
         }
+        // What came in over Telegram, and what goes back out over it.
+        if !announced_before {
+            tagged.extend(self.start_telegram());
+        }
+        tagged.extend(self.telegram_heard());
+        self.telegram_tell(&tagged);
         // Whatever the limits on what is learned have just changed is said,
         // so the learning can be seen.
         if !tagged.is_empty()
@@ -1412,9 +1457,14 @@ impl Live {
                     return Vec::new();
                 }
                 // The loop sees the flag at its next step; a call waiting
-                // for approval is answered no.
+                // for approval is answered no, and so is a secret it was
+                // waiting for.
                 t.stop.store(true, Ordering::Relaxed);
                 t.decisions = None;
+                self.secret_waiters
+                    .lock()
+                    .unwrap()
+                    .retain(|(waiting, _, _)| *waiting != task);
                 tag(
                     task,
                     vec![EventKind::Alert {
@@ -1423,6 +1473,7 @@ impl Live {
                     }],
                 )
             }
+            Command::Secret { name, value } => self.take_secret(&name, value),
             Command::Restart => Vec::new(),
         }
     }
@@ -1463,6 +1514,265 @@ impl Live {
         self.tasks[at].criteria.clear();
         events.extend(self.begin(MAIN, text));
         events
+    }
+
+    /// Takes a secret the user typed into its window (or their refusal to
+    /// give one). The value goes to the store and nowhere else: it is in no
+    /// event, and whoever was waiting is told only that it is there.
+    fn take_secret(&mut self, name: &str, value: Option<crate::secrets::Hidden>) -> Vec<Tagged> {
+        let stored = match value {
+            Some(value) => crate::secrets::store()
+                .lock()
+                .unwrap()
+                .set(name, &value.0)
+                .map(|()| true),
+            None => Ok(false),
+        };
+        let mut waiting = Vec::new();
+        self.secret_waiters
+            .lock()
+            .unwrap()
+            .retain(|(task, asked, tx)| {
+                if asked == name {
+                    let _ = tx.send(matches!(stored, Ok(true)));
+                    waiting.push(*task);
+                    false
+                } else {
+                    true
+                }
+            });
+        let answered = EventKind::SecretAnswered {
+            name: name.to_string(),
+            stored: matches!(stored, Ok(true)),
+        };
+        let said = EventKind::Alert {
+            severity: match &stored {
+                Ok(true) => Severity::Success,
+                Ok(false) => Severity::Info,
+                Err(_) => Severity::Error,
+            },
+            text: match &stored {
+                Ok(true) => format!(
+                    "Secret {name} is stored. Its value is not shown anywhere and is never \
+                     sent to a model; a command that uses it asks you first."
+                ),
+                Ok(false) => format!("Secret {name} was not given."),
+                Err(why) => format!("Secret {name} could not be stored: {why}"),
+            },
+        };
+        let mut events = Vec::new();
+        if waiting.is_empty() {
+            events.push(Tagged::system(answered));
+            events.push(Tagged::system(said));
+        } else {
+            for task in waiting {
+                events.extend(tag(task, vec![answered.clone(), said.clone()]));
+            }
+        }
+        events.extend(self.telegram_follow(name));
+        events
+    }
+
+    /// Whether something outside keeps this harness needed with no screen
+    /// attached: a connected bot can bring a message at any time.
+    pub fn connected(&self) -> bool {
+        self.telegram.is_some()
+    }
+
+    /// Connects the Telegram bot if the user has given its token.
+    fn start_telegram(&mut self) -> Vec<Tagged> {
+        let Some(token) = crate::secrets::get(crate::telegram::TOKEN) else {
+            return Vec::new();
+        };
+        let path =
+            crate::learn::default_path().and_then(|p| Some(p.parent()?.join("telegram.json")));
+        self.connect_telegram(Arc::new(crate::telegram::Api::new(token)), path)
+    }
+
+    /// When the secret just entered is the bot's token, (re)connects it.
+    fn telegram_follow(&mut self, name: &str) -> Vec<Tagged> {
+        if name != crate::telegram::TOKEN {
+            return Vec::new();
+        }
+        self.telegram = None;
+        self.start_telegram()
+    }
+
+    /// Starts listening to `bot` and says how to pair with it.
+    fn connect_telegram(
+        &mut self,
+        bot: Arc<dyn crate::telegram::Bot>,
+        path: Option<std::path::PathBuf>,
+    ) -> Vec<Tagged> {
+        let pairing: crate::telegram::Pairing = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        let code = crate::telegram::new_code();
+        let alive = Arc::new(AtomicBool::new(true));
+        let (heard_tx, heard) = mpsc::channel();
+        let (out, out_rx) = mpsc::channel::<(i64, String)>();
+        // Reading: one long request after another.
+        let (reader, living, report) = (bot.clone(), alive.clone(), self.out(None));
+        let mut after = pairing.after;
+        thread::spawn(move || {
+            let mut said = String::new();
+            while living.load(Ordering::Relaxed) {
+                match reader.updates(after, crate::telegram::WAIT_SECS) {
+                    Ok((messages, last)) => {
+                        after = after.max(last);
+                        said.clear();
+                        for message in messages {
+                            if heard_tx.send(message).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(why) => {
+                        // Said once, not every few seconds.
+                        if why != said {
+                            report.send(Update::Event(EventKind::Alert {
+                                severity: Severity::Warn,
+                                text: format!("Telegram: {why}"),
+                            }));
+                            said = why.clone();
+                        }
+                        // A token Telegram refuses will not start working.
+                        if why.contains("does not accept the bot token") {
+                            return;
+                        }
+                        thread::sleep(Duration::from_secs(10));
+                    }
+                }
+            }
+        });
+        // Sending.
+        let report = self.out(None);
+        thread::spawn(move || {
+            for (chat, text) in out_rx {
+                if let Err(why) = bot.send(chat, &text) {
+                    report.send(Update::Event(EventKind::Alert {
+                        severity: Severity::Warn,
+                        text: format!("Telegram: a reply could not be sent: {why}"),
+                    }));
+                }
+            }
+        });
+        let text = match pairing.owner {
+            Some(_) => "Telegram: the bot is connected and paired. What you send it is said \
+                        to main, and main's replies are sent back to you there."
+                .to_string(),
+            None => format!(
+                "Telegram: the bot is connected but answers to nobody yet. To make it \
+                 yours, send it this message from your Telegram account: /pair {code}"
+            ),
+        };
+        self.telegram = Some(Bridge {
+            pairing,
+            path,
+            code,
+            heard,
+            out,
+            alive,
+        });
+        vec![Tagged::system(EventKind::Alert {
+            severity: Severity::Info,
+            text,
+        })]
+    }
+
+    /// Takes what the bot has heard: pairs, or says it to main.
+    fn telegram_heard(&mut self) -> Vec<Tagged> {
+        use crate::telegram::Heard;
+        let Some(bridge) = &mut self.telegram else {
+            return Vec::new();
+        };
+        let messages: Vec<_> = bridge.heard.try_iter().collect();
+        let mut events = Vec::new();
+        for message in messages {
+            let Some(bridge) = &mut self.telegram else {
+                break;
+            };
+            bridge.pairing.after = bridge.pairing.after.max(message.update);
+            let heard = crate::telegram::hear(&bridge.pairing, &bridge.code, &message);
+            match heard {
+                Heard::Pair(owner) => {
+                    bridge.pairing.owner = Some(owner);
+                    let _ = bridge.out.send((
+                        message.chat,
+                        "Paired. What you send here is said to conscious's main conversation, \
+                         and its replies come back here. Anything that needs your approval \
+                         waits on its screen."
+                            .into(),
+                    ));
+                    events.push(Tagged::system(EventKind::Alert {
+                        severity: Severity::Success,
+                        text: "Telegram: paired with the account that sent the code. Only \
+                               that account is heard from now on."
+                            .into(),
+                    }));
+                }
+                Heard::Reply(text) => {
+                    let _ = bridge.out.send((message.chat, text));
+                }
+                Heard::Nothing => {}
+                Heard::Say(text) => {
+                    bridge.save();
+                    events.extend(self.say(text));
+                    continue;
+                }
+            }
+            bridge.save();
+        }
+        events
+    }
+
+    /// Sends the owner what main said, what a branch brought back, and a
+    /// word when something is waiting for them at the screen.
+    fn telegram_tell(&self, events: &[Tagged]) {
+        let Some(bridge) = &self.telegram else {
+            return;
+        };
+        let Some(owner) = bridge.pairing.owner else {
+            return;
+        };
+        for event in events {
+            let text = match &event.kind {
+                EventKind::Message {
+                    agent: Some(_),
+                    text,
+                } if event.task == Some(MAIN) => text.clone(),
+                EventKind::Merged {
+                    branch,
+                    title,
+                    result,
+                    ok,
+                } => {
+                    if *ok {
+                        format!("Branch #{branch} ({title}) has ended:\n\n{result}")
+                    } else {
+                        format!("Branch #{branch} ({title}) ended without an answer.")
+                    }
+                }
+                EventKind::ToolRequested {
+                    tool,
+                    args,
+                    needs_approval: true,
+                    ..
+                } => format!(
+                    "Waiting for your approval at the screen: {tool} {}",
+                    args.lines().next().unwrap_or_default()
+                ),
+                EventKind::SecretAsked { name, .. } => format!(
+                    "Waiting for you to type the secret {name} at the screen. Do not send \
+                     it here."
+                ),
+                _ => continue,
+            };
+            // Anything secret is taken out before it leaves the machine.
+            let _ = bridge.out.send((owner, crate::guard::redact(&text)));
+        }
     }
 
     /// Opens a branch off main for one piece of work. It starts at once, or
@@ -1826,6 +2136,7 @@ impl Live {
                     agent_ids: self.agent_ids.clone(),
                     claims: self.claims.clone(),
                     task: id,
+                    secret_waiters: self.secret_waiters.clone(),
                     main: id == MAIN,
                     given: self.tasks[at].given.clone(),
                     goals: self.goals,
@@ -2244,6 +2555,7 @@ fn run_self_update(
         given: &|_| {},
         self_update: &|_, _| "a self-update cannot ask for another".to_string(),
         branch: None,
+        secret: &|_, _| false,
         web: &crate::research::Web,
         stop,
         limits: agent::Limits::default(),
@@ -2544,6 +2856,7 @@ struct TaskEnv {
     agent_ids: Arc<AtomicU32>,
     claims: Arc<Mutex<crate::claims::Claims>>,
     task: u32,
+    secret_waiters: SecretWaiters,
     /// Whether this is the main conversation, which may open branches.
     main: bool,
     given: Arc<Mutex<Vec<NodeId>>>,
@@ -2630,6 +2943,20 @@ fn run_task(
              the change. Finish now: tell the user what could not be done, and that a change \
              to the harness was started for it."
                 .to_string()
+        },
+        // The user is asked on the screen; this waits for the answer. The
+        // value itself goes to the store, never through here.
+        secret: &|name, why| {
+            let (answer, answered) = mpsc::channel();
+            env.secret_waiters
+                .lock()
+                .unwrap()
+                .push((env.task, name.to_string(), answer));
+            send(EventKind::SecretAsked {
+                name: name.to_string(),
+                why: why.to_string(),
+            });
+            answered.recv().unwrap_or(false)
         },
         branch: env.main.then_some(&open_branch as &agent::OpenBranch<'_>),
         web: &crate::research::Web,
@@ -3937,6 +4264,208 @@ mod tests {
             })
             .count();
         assert_eq!(answers, 2);
+    }
+
+    #[test]
+    fn a_secret_is_typed_by_the_user_and_its_value_reaches_no_event_and_no_model() {
+        use crate::provider::testing::Queue;
+        use crate::secrets::Hidden;
+        let root =
+            std::env::temp_dir().join(format!("conscious-live-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let core = Queue::new(
+            "core",
+            &[
+                r#"CALL secret {"action": "request", "name": "LIVE_TEST_KEY", "why": "to publish the package"}"#,
+                "The key is stored; I will use it as $LIVE_TEST_KEY.",
+            ],
+        );
+        let guard = Arc::new(Guard::new(&root).unwrap());
+        let mut live = Live::new(Arc::new(Router::single(Arc::new(core)))).with_guard(Some(guard));
+        live.poll();
+        ask(&mut live, "publish the package".into());
+        // The agent asks; the request names the secret and says why, and
+        // nothing more. It does not need approving: the user answers it by
+        // typing, or not.
+        let mut events = until(&mut live, |e| {
+            e.iter()
+                .any(|e| matches!(e.kind, EventKind::SecretAsked { .. }))
+        });
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::SecretAsked { name, why }
+                if e.task == Some(1) && name == "LIVE_TEST_KEY" && why == "to publish the package"
+        )));
+        assert!(live.busy(), "the task waits for the user");
+
+        // The user types it into its window.
+        let stored = live.handle(Command::Secret {
+            name: "LIVE_TEST_KEY".into(),
+            value: Some(Hidden("val-0123456789-live".into())),
+        });
+        assert!(stored.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::SecretAnswered { name, stored: true } if e.task == Some(1) && name == "LIVE_TEST_KEY"
+        )));
+        events.extend(stored);
+        events.extend(until(&mut live, |e| {
+            state_of(e, 1) == Some(TaskState::Done)
+        }));
+        // It is in the store, and the model was told only that it is there.
+        assert_eq!(
+            crate::secrets::get("LIVE_TEST_KEY").as_deref(),
+            Some("val-0123456789-live")
+        );
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::ToolFinished { ok: true, output, .. } if output.contains("The user entered LIVE_TEST_KEY")
+        )));
+        // The value is in no event at all, and so not in the timeline, on
+        // the screen, or in anything sent to a model or to Telegram.
+        assert!(!format!("{events:?}").contains("val-0123456789-live"));
+        let thread: String = live
+            .tasks
+            .iter()
+            .flat_map(|t| t.thread.iter().map(|m| m.content.clone()))
+            .collect();
+        assert!(!thread.contains("val-0123456789-live"));
+
+        // Declining tells the agent no, and stores nothing.
+        let core = Queue::new(
+            "core",
+            &[
+                r#"CALL secret {"action": "request", "name": "LIVE_TEST_REFUSED"}"#,
+                "I cannot go on without it.",
+            ],
+        );
+        let guard = Arc::new(Guard::new(&root).unwrap());
+        let mut live = Live::new(Arc::new(Router::single(Arc::new(core)))).with_guard(Some(guard));
+        live.poll();
+        ask(&mut live, "publish the package".into());
+        until(&mut live, |e| {
+            e.iter()
+                .any(|e| matches!(e.kind, EventKind::SecretAsked { .. }))
+        });
+        live.handle(Command::Secret {
+            name: "LIVE_TEST_REFUSED".into(),
+            value: None,
+        });
+        let events = until(&mut live, |e| state_of(e, 1) == Some(TaskState::Done));
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::ToolFinished { ok: false, output, .. } if output.contains("did not enter")
+        )));
+        assert_eq!(crate::secrets::get("LIVE_TEST_REFUSED"), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A bot that hears what a test puts in and keeps what it was sent.
+    #[derive(Default)]
+    struct FakeBot {
+        incoming: Mutex<VecDeque<crate::telegram::Incoming>>,
+        sent: Mutex<Vec<(i64, String)>>,
+        update: AtomicU32,
+    }
+
+    impl FakeBot {
+        fn hears(&self, from: i64, private: bool, text: &str) {
+            let update = i64::from(self.update.fetch_add(1, Ordering::Relaxed)) + 1;
+            self.incoming
+                .lock()
+                .unwrap()
+                .push_back(crate::telegram::Incoming {
+                    update,
+                    chat: from,
+                    from,
+                    private,
+                    text: text.into(),
+                });
+        }
+
+        fn sent(&self) -> Vec<(i64, String)> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::telegram::Bot for FakeBot {
+        fn updates(
+            &self,
+            after: i64,
+            _: u32,
+        ) -> Result<(Vec<crate::telegram::Incoming>, i64), String> {
+            let got: Vec<_> = self.incoming.lock().unwrap().drain(..).collect();
+            if got.is_empty() {
+                thread::sleep(Duration::from_millis(3));
+            }
+            let last = got.iter().map(|m| m.update).max().unwrap_or(after);
+            Ok((got, last))
+        }
+
+        fn send(&self, chat: i64, text: &str) -> Result<(), String> {
+            self.sent.lock().unwrap().push((chat, text.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_paired_telegram_account_talks_to_main_and_nobody_else_is_heard() {
+        let bot = Arc::new(FakeBot::default());
+        let mut live = Live::new(single(Fixed("It is high tide.")));
+        live.poll();
+        assert!(!live.connected());
+        let said = live.connect_telegram(bot.clone(), None);
+        assert!(live.connected());
+        let code = live.telegram.as_ref().unwrap().code.clone();
+        // The way to pair is said on the harness's own screen only.
+        assert!(matches!(
+            &said[..],
+            [Tagged { task: None, kind: EventKind::Alert { text, .. } }]
+                if text.contains(&format!("/pair {code}"))
+        ));
+        type Sent = [(i64, String)];
+        let wait_for = |live: &mut Live, done: &dyn Fn(&Sent) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut events = Vec::new();
+            while !done(&bot.sent()) {
+                assert!(Instant::now() < deadline, "sent: {:?}", bot.sent());
+                events.extend(live.poll());
+                thread::sleep(Duration::from_millis(3));
+            }
+            events
+        };
+
+        // Before pairing, nothing anyone sends reaches the conversation.
+        bot.hears(9, true, "delete everything");
+        wait_for(&mut live, &|sent| sent.len() == 1);
+        assert!(bot.sent()[0].1.contains("not paired"));
+        assert!(live.tasks.is_empty());
+
+        // The account that sends the code becomes the owner.
+        bot.hears(7, true, &format!("/pair {code}"));
+        let events = wait_for(&mut live, &|sent| sent.len() == 2);
+        assert_eq!(bot.sent()[1].0, 7);
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Alert { severity: Severity::Success, text } if text.contains("paired")
+        )));
+
+        // What the owner says goes to main, and main's reply goes back.
+        bot.hears(8, true, "what is the tide doing");
+        bot.hears(7, false, "said in a group");
+        bot.hears(7, true, "what is the tide doing");
+        let events = wait_for(&mut live, &|sent| sent.len() == 3);
+        assert_eq!(bot.sent()[2], (7, "It is high tide.".to_string()));
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Message { agent: None, text }
+                if e.task == Some(MAIN) && text == "what is the tide doing"
+        )));
+        // The stranger and the group were heard by nobody: one message
+        // reached main, and one answer left.
+        let main = live.tasks.iter().find(|t| t.id == MAIN).unwrap();
+        assert_eq!(main.thread.len(), 2);
+        assert_eq!(live.tasks.len(), 1);
     }
 
     /// A model that writes its reply in pieces, then waits to be let go.

@@ -232,6 +232,17 @@ pub enum EventKind {
         result: String,
         ok: bool,
     },
+    /// The agent needs a secret (an API key, a token) and asks the user to
+    /// type it into the secret window. Only its name is ever in an event.
+    SecretAsked {
+        name: String,
+        why: String,
+    },
+    /// The user answered: the secret was stored, or they declined.
+    SecretAnswered {
+        name: String,
+        stored: bool,
+    },
     /// The task's success criteria, checked against the finished work.
     CriteriaChecked {
         checked: Vec<crate::goal::Checked>,
@@ -362,6 +373,8 @@ impl EventKind {
             EventKind::TaskUpdate { .. } => "TaskUpdate",
             EventKind::Research { .. } => "Research",
             EventKind::Merged { .. } => "Merged",
+            EventKind::SecretAsked { .. } => "SecretAsked",
+            EventKind::SecretAnswered { .. } => "SecretAnswered",
             EventKind::CriteriaChecked { .. } => "CriteriaChecked",
             EventKind::GoalSet { .. } => "GoalSet",
             EventKind::PlanUpdated { .. } => "PlanUpdated",

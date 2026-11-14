@@ -193,6 +193,16 @@ pub fn specs() -> Vec<ToolSpec> {
             &["problem", "change"],
         ),
         spec(
+            "secret",
+            "Work with the user's secrets (API keys, tokens, passwords) without ever seeing them. `list` gives the names of the secrets the user has stored. `request` asks the user to type one into a separate window on their screen: the value goes straight to the harness's secret store and is never shown to you. To use a stored secret, write `$NAME` in a shell command: the harness puts the value in that command's environment (the user is asked first each time) and removes it from the output you get back. Never ask the user to paste a key into the conversation, and never try to print or read a secret's value.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "request"]},
+                "name": string("For `request`: the secret's name, in capitals like an environment variable (GITHUB_TOKEN)"),
+                "why": string("For `request`: one line telling the user what it is for and where to get it"),
+            }),
+            &["action"],
+        ),
+        spec(
             "branch",
             "Open a branch: a piece of work that runs by itself alongside this conversation, in its own tab, and whose result is merged back into this conversation when it ends. Use it when what the user wants is real work of its own (many steps, long, or separate from what is being talked about), so that this conversation stays free. Do not use it for something you can answer or do in a few steps here. The branch starts with nothing from this conversation, so `task` must say everything it needs. After calling it, do not do that work yourself: tell the user in a line that the branch was opened and carry on.",
             json!({
@@ -235,6 +245,9 @@ pub fn describe(tool: &str, args: &Value) -> String {
             .to_string(),
         "delegate" => text("task").to_string(),
         "branch" => text("title").to_string(),
+        "secret" => format!("{} {}", text("action"), text("name"))
+            .trim()
+            .to_string(),
         "research" => text("question").to_string(),
         "browse" => text("url").to_string(),
         "self_update" => text("change").to_string(),
@@ -575,6 +588,7 @@ mod tests {
                 "research",
                 "browse",
                 "self_update",
+                "secret",
                 "branch",
                 "delegate",
                 "plan"

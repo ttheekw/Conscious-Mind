@@ -392,7 +392,11 @@ impl Server {
     /// Whether there is still something to stay for. With nothing for
     /// `linger`, the daemon ends.
     fn wanted(&mut self) -> bool {
-        if !self.screens.is_empty() || !self.live.settled() || self.jobs() > 0 {
+        if !self.screens.is_empty()
+            || !self.live.settled()
+            || self.jobs() > 0
+            || self.live.connected()
+        {
             self.quiet = None;
             return true;
         }

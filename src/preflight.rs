@@ -66,6 +66,12 @@ fn env_set(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
 }
 
+/// Whether an API key is to hand: in the environment, or among the secrets
+/// the user typed into the secret window.
+fn key_set(name: &str) -> bool {
+    env_set(name) || crate::secrets::get(name).is_some()
+}
+
 /// Whether the folder the harness keeps its data in can be written.
 fn data_folder() -> Result<String, String> {
     let file = crate::learn::default_path().ok_or("there is no home directory")?;
@@ -92,8 +98,8 @@ pub fn probe(named: Option<String>) -> Facts {
             .into_iter()
             .map(|m| m.spec)
             .collect(),
-        openai_key: env_set("OPENAI_API_KEY"),
-        openrouter_key: env_set("OPENROUTER_API_KEY"),
+        openai_key: key_set("OPENAI_API_KEY"),
+        openrouter_key: key_set("OPENROUTER_API_KEY"),
         data: data_folder(),
         sandbox: crate::guard::sandbox_works(Path::new(".")),
         terminal: std::io::stdout().is_terminal() && std::io::stdin().is_terminal(),
@@ -401,6 +407,46 @@ impl Report {
     }
 }
 
+impl Report {
+    /// What a first start says before anything else: that conscious brings
+    /// no model of its own, which ones it works through, and what this
+    /// machine has. Pure: the same report gives the same text.
+    pub fn welcome(&self) -> String {
+        let mut out = String::from(
+            "conscious does not come with a model. It works through one you already have:\n\n\
+             \x20 Claude Code   the `claude` command, installed and signed in\n\
+             \x20 Codex         the `codex` command, installed and signed in\n\n\
+             It can also use a local server that is running (llama-server, Ollama), or an\n\
+             OpenAI or OpenRouter key when you name that model with --model. Nothing else\n\
+             is supported.\n\n\
+             Checking this machine:\n\n",
+        );
+        out.push_str(&self.render());
+        out
+    }
+
+    /// The backends to try on a first start, in a fixed order: the one the
+    /// rules chose as the core, then every other one that looks ready.
+    pub fn first_run_order(&self) -> Vec<String> {
+        let mut order: Vec<String> = self.core.iter().cloned().collect();
+        for spec in &self.ready {
+            if !order.contains(spec) {
+                order.push(spec.clone());
+            }
+        }
+        order
+    }
+}
+
+/// Where it is noted that the first-start check has passed on this machine.
+pub fn first_run_marker() -> Option<std::path::PathBuf> {
+    Some(
+        crate::learn::default_path()?
+            .parent()?
+            .join("first-run-checked"),
+    )
+}
+
 /// Sends one small real request to `spec` and says how it went. The only
 /// part of the checks that uses a model, and only when asked for.
 pub fn call(spec: &str) -> Result<String, String> {
@@ -441,6 +487,36 @@ mod tests {
 
     fn level(report: &Report, name: &str) -> Level {
         report.checks.iter().find(|c| c.name == name).unwrap().level
+    }
+
+    #[test]
+    fn a_first_start_says_what_is_supported_and_tries_the_core_before_the_rest() {
+        // Nothing usable: the welcome still says what would be.
+        let none = judge(&facts());
+        let text = none.welcome();
+        for needed in ["Claude Code", "Codex", "does not come with a model", "FAIL"] {
+            assert!(text.contains(needed), "missing {needed:?} in:\n{text}");
+        }
+        assert!(none.first_run_order().is_empty());
+
+        // Both signed in: Claude Code is the core, so it is asked first,
+        // and Codex is what is tried if it does not answer.
+        let both = judge(&Facts {
+            claude: Some(Login::Yes),
+            codex: Some(Login::Yes),
+            ..facts()
+        });
+        assert_eq!(both.first_run_order(), ["claude-code", "codex"]);
+        assert_eq!(both.welcome(), both.welcome());
+
+        // A named model is the only one tried first; the others follow.
+        let named = judge(&Facts {
+            named: Some("codex".into()),
+            claude: Some(Login::Yes),
+            codex: Some(Login::Yes),
+            ..facts()
+        });
+        assert_eq!(named.first_run_order()[0], "codex");
     }
 
     #[test]

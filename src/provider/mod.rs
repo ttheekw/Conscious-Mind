@@ -270,11 +270,20 @@ pub fn from_spec(spec: &str) -> Result<Box<dyn Provider>, ProviderError> {
             ProviderError::Config(format!("`{name}` needs a model, e.g. `{name}:<model-id>`"))
         })
     };
+    // A key comes from the environment, or from the secrets the user typed
+    // into the secret window. It is held by the provider and sent only to
+    // that provider's own endpoint.
     let need_key = |var: &str| {
         std::env::var(var)
             .ok()
             .filter(|k| !k.trim().is_empty())
-            .ok_or_else(|| ProviderError::Config(format!("{var} is not set")))
+            .or_else(|| crate::secrets::get(var))
+            .ok_or_else(|| {
+                ProviderError::Config(format!(
+                    "{var} is not set (set it in the environment, or press K in conscious \
+                     and enter it as a secret)"
+                ))
+            })
     };
     let env_or = |var: &str, default: &str| {
         std::env::var(var)
