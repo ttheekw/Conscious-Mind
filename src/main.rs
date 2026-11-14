@@ -74,6 +74,7 @@ conscious --no-criteria            do not set success criteria for each task (sa
 conscious --no-self-update         never let it change its own source code
 conscious selfupdate               what it has tried to change in its own code, and what came of each
 conscious selfupdate rollback      take the newest adopted change to its own code back
+conscious telegram                 connect a Telegram bot: its token, then pairing with your account
 conscious secrets [remove NAME]    the names of the secrets you have stored (enter one with K in the TUI)
 conscious skills                   the procedures the agent has written for itself
 conscious lessons                  the lessons it has drawn, whether each is confirmed, and how it has fared
@@ -297,6 +298,9 @@ fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().is_some_and(|a| a == "knowledge") {
         return knowledge::cli::run(&raw[1..]);
+    }
+    if raw.first().is_some_and(|a| a == "telegram") {
+        return telegram_command();
     }
     if raw.first().is_some_and(|a| a == "secrets") {
         return secrets_command(&raw[1..]);
@@ -921,6 +925,141 @@ fn secrets_command(args: &[String]) -> ExitCode {
     }
 }
 
+/// Reads a line typed at the terminal without showing it, for a secret.
+/// `None` if there is no terminal to read from.
+fn read_hidden(prompt: &str) -> Option<String> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    // The terminal is told not to echo; if that cannot be done the secret
+    // is not asked for at all, so it is never shown.
+    let echo = |on: bool| {
+        std::process::Command::new("stty")
+            .arg(if on { "echo" } else { "-echo" })
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if !echo(false) {
+        println!("\n(this terminal cannot hide what is typed; press K in conscious instead)");
+        return None;
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    echo(true);
+    println!();
+    read.ok().map(|_| line.trim().to_string())
+}
+
+/// `conscious telegram`: connects a Telegram bot, in the terminal.
+fn telegram_command() -> ExitCode {
+    if !telegram_setup() {
+        return ExitCode::FAILURE;
+    }
+    let running = daemon::socket_path().and_then(|path| daemon::status(&path, QUICK).ok());
+    if running.is_some() {
+        println!(
+            "conscious is running in the background with the old settings. Run \
+             `conscious stop`, then `conscious`, for it to use the bot."
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Connects a Telegram bot from the terminal: says how to make one, takes
+/// its token without showing it, checks it with Telegram, stores it as a
+/// secret, then waits for the user's own account to send the pairing code.
+/// Every step can be skipped. Returns whether a bot is connected and
+/// paired at the end.
+fn telegram_setup() -> bool {
+    use telegram::{Api, Bot, Heard, Pairing};
+    println!(
+        "Telegram (optional). You can talk to conscious from your phone through a bot of \
+         your own:\n\
+         \x20 1. In Telegram, open @BotFather, send /newbot and follow it. It gives you a token.\n\
+         \x20 2. Paste the token here. It is not shown as you type, and is kept as a secret\n\
+         \x20    on this machine that no model ever sees. Press Enter to skip."
+    );
+    let Some(path) = telegram::pairing_path() else {
+        return false;
+    };
+    let (api, name) = loop {
+        let Some(token) = read_hidden("Token: ") else {
+            return false;
+        };
+        if token.is_empty() {
+            println!("Skipped. Later: run `conscious telegram`, or press K in conscious.\n");
+            return false;
+        }
+        let api = Api::new(token.clone());
+        match api.username() {
+            Ok(name) => {
+                if let Err(e) = secrets::store()
+                    .lock()
+                    .unwrap()
+                    .set(telegram::TOKEN, &token)
+                {
+                    println!("FAIL  the token could not be stored: {e}\n");
+                    return false;
+                }
+                break (api, name);
+            }
+            Err(why) => println!("FAIL  {why}\n      Try again, or press Enter to skip."),
+        }
+    };
+    println!("ok    the bot is @{name}, and its token is stored.\n");
+    let mut pairing = Pairing::load(&path);
+    if pairing.owner.is_some() {
+        println!("It is already paired with your account.\n");
+        return true;
+    }
+    let code = telegram::new_code();
+    println!(
+        "\x20 3. Open https://t.me/{name} in Telegram and send it this message:\n\n\
+         \x20        /pair {code}\n\n\
+         Waiting up to 3 minutes for it (Ctrl-C to stop waiting)..."
+    );
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while Instant::now() < deadline {
+        let (messages, last) = match api.updates(pairing.after, 10) {
+            Ok(got) => got,
+            Err(why) => {
+                println!("FAIL  {why}");
+                break;
+            }
+        };
+        pairing.after = pairing.after.max(last);
+        for message in messages {
+            match telegram::hear(&pairing, &code, &message) {
+                Heard::Pair(owner) => {
+                    pairing.owner = Some(owner);
+                    pairing.save(&path);
+                    let _ = api.send(
+                        message.chat,
+                        "Paired. What you send here is said to conscious's main conversation, \
+                         and its replies come back here. A call that needs your approval comes \
+                         with Approve and Deny buttons.",
+                    );
+                    println!("ok    paired. Only that account is heard from now on.\n");
+                    return true;
+                }
+                Heard::Reply(text) => {
+                    let _ = api.send(message.chat, &text);
+                }
+                _ => {}
+            }
+        }
+    }
+    pairing.save(&path);
+    println!(
+        "Not paired yet. The bot is connected; conscious shows a new pairing code on its \
+         screen when it starts.\n"
+    );
+    false
+}
+
 /// The check a first start makes, in view, before anything is started:
 /// says what conscious works through, shows what this machine has, and
 /// sends one small real request to make sure a model really answers
@@ -941,6 +1080,8 @@ fn first_run(report: &preflight::Report, chosen: String) -> Result<String, ExitC
             Ok(how) => {
                 println!("ok    {how}\n");
                 let _ = std::fs::write(&marker, format!("{spec}\n"));
+                // The one optional step of setting up, offered once.
+                telegram_setup();
                 return Ok(spec);
             }
             Err(why) => println!("FAIL  {spec}: {why}\n"),

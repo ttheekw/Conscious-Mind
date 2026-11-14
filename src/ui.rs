@@ -1040,14 +1040,12 @@ fn body_lines(
 /// answered, what a branch brought back, and what went wrong. The user
 /// asked for this (2026-11-14): the steps in between were too much.
 ///
-/// A branch's tab also keeps what the agent said on the way (`Thought`):
-/// that text was on screen while it was being written, and it must not
-/// vanish when the model call that wrote it ends and the tab is left and
-/// come back to. Main stays the conversation only.
-fn in_conversation(kind: &EventKind, in_branch: bool) -> bool {
+/// What the agent says before taking a step (`Thought`) is a step, not
+/// conversation: it shows while it is being written and is then in the
+/// tab's raw events, in main and in a branch alike.
+fn in_conversation(kind: &EventKind) -> bool {
     match kind {
         EventKind::Message { .. } | EventKind::Merged { .. } => true,
-        EventKind::Thought { .. } => in_branch,
         EventKind::Alert { severity, .. } => {
             matches!(severity, Severity::Warn | Severity::Error)
         }
@@ -1862,7 +1860,6 @@ fn render_stream(f: &mut Frame, app: &mut App, area: Rect) {
     let w = inner.width.saturating_sub(1) as usize;
     let mut rows: Vec<(Line<'static>, usize)> = Vec::new();
     let mut visible = Vec::new();
-    let in_branch = app.task_sel.is_some_and(|task| task != MAIN);
     for idx in 0..app.events.len() {
         if let Some(filter) = app.agent_filter
             && app.events[idx].kind.agent() != Some(filter)
@@ -1881,7 +1878,7 @@ fn render_stream(f: &mut Frame, app: &mut App, area: Rect) {
         let lines = match app.tab {
             // Activity is the conversation and nothing else; every step
             // behind it is in the raw events view.
-            Tab::Timeline if !in_conversation(&app.events[idx].kind, in_branch) => Vec::new(),
+            Tab::Timeline if !in_conversation(&app.events[idx].kind) => Vec::new(),
             Tab::Timeline => timeline_entry(app, idx, w),
             Tab::Events => raw_entry(app, idx, w),
             Tab::Memory => memory_entry(app, idx, w),

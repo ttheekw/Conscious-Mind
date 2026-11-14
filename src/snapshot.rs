@@ -1089,6 +1089,15 @@ fn tab_views(app: &mut App, task: u32) -> (Vec<Vec<usize>>, String) {
     (views, activity)
 }
 
+/// A task's RAW EVENTS view as text.
+fn raw_screen(app: &mut App, task: u32) -> String {
+    app.select_task(Some(task));
+    key(app, KeyCode::Char('2'));
+    let screen = text(&render(app));
+    key(app, KeyCode::Char('1'));
+    screen
+}
+
 #[test]
 fn a_branch_keeps_what_it_showed_after_a_visit_to_main() {
     use crate::event::{EventKind as E, Risk, Severity, TaskState};
@@ -1129,10 +1138,15 @@ fn a_branch_keeps_what_it_showed_after_a_visit_to_main() {
         screen.contains("explain how spring tides differ"),
         "{screen}"
     );
+    // What it said before a step is a step, not conversation: it is in
+    // the branch's raw events, not its activity.
     assert!(
-        screen.contains("Reading the tide tables first."),
+        !screen.contains("Reading the tide tables first."),
         "{screen}"
     );
+    let raw = raw_screen(&mut app, 2);
+    assert!(raw.contains("Reading the tide"), "{raw}");
+    assert!(raw.contains("tides.md"), "{raw}");
     assert!(screen.contains("tides.md is longer"), "{screen}");
     assert!(
         screen.contains("Design settled: springs follow"),
@@ -1195,12 +1209,12 @@ fn a_branch_keeps_what_it_showed_after_a_visit_to_main() {
             assert!(after.contains(idx), "event {idx} is gone:\n{screen}");
         }
     }
-    for expected in [
-        "explain how spring tides differ",
-        "Reading the tide tables first.",
-        "tides.md is longer",
-        "Design settled: springs follow",
-    ] {
+    // Every step, old and new, is in its raw events.
+    let raw = raw_screen(&mut app, 2);
+    for expected in ["Reading the tide", "Design settled", "wc -l tides.md"] {
+        assert!(raw.contains(expected), "missing {expected:?} in:\n{raw}");
+    }
+    for expected in ["explain how spring tides differ", "tides.md is longer"] {
         assert!(
             screen.contains(expected),
             "missing {expected:?} in:\n{screen}"
@@ -1247,14 +1261,12 @@ fn a_branch_keeps_what_it_showed_after_a_visit_to_main() {
             assert!(after.contains(idx), "event {idx} is gone:\n{screen}");
         }
     }
-    for expected in [
-        "Reading the tide tables first.",
-        "Design settled: springs follow",
-        "Spring tides come twice a month.",
-    ] {
-        assert!(
-            screen.contains(expected),
-            "missing {expected:?} in:\n{screen}"
-        );
+    let raw = raw_screen(&mut app, 2);
+    for expected in ["Reading the tide", "Design settled", "wc -l tides.md"] {
+        assert!(raw.contains(expected), "missing {expected:?} in:\n{raw}");
     }
+    assert!(
+        screen.contains("Spring tides come twice a month."),
+        "{screen}"
+    );
 }

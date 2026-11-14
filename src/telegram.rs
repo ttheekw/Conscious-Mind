@@ -97,6 +97,30 @@ pub struct Pairing {
     pub after: i64,
 }
 
+/// Where the pairing is kept: beside the routing knowledge.
+pub fn pairing_path() -> Option<std::path::PathBuf> {
+    Some(
+        crate::learn::default_path()?
+            .parent()?
+            .join("telegram.json"),
+    )
+}
+
+impl Pairing {
+    pub fn load(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &std::path::Path) {
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
+
 /// What to do with something sent to the bot, by the rules above.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Heard {
@@ -372,6 +396,15 @@ impl Api {
     /// address every request goes to).
     fn clean(&self, text: String) -> String {
         text.replace(&self.token, "[token]")
+    }
+
+    /// The bot's own name (`@name`), which also shows the token is good.
+    pub fn username(&self) -> Result<String, String> {
+        let answer = self.call("getMe", json!({}), 0)?;
+        answer["result"]["username"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "Telegram did not say what the bot is called".to_string())
     }
 
     fn agent(wait: u32) -> ureq::Agent {

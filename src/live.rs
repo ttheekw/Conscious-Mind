@@ -1619,8 +1619,7 @@ impl Live {
         let Some(token) = crate::secrets::get(crate::telegram::TOKEN) else {
             return Vec::new();
         };
-        let path =
-            crate::learn::default_path().and_then(|p| Some(p.parent()?.join("telegram.json")));
+        let path = crate::telegram::pairing_path();
         self.connect_telegram(Arc::new(crate::telegram::Api::new(token)), path)
     }
 
@@ -1714,6 +1713,7 @@ impl Live {
                 }
             }
         });
+        let unpaired = pairing.owner.is_none();
         let text = match pairing.owner {
             Some(_) => "Telegram: the bot is connected and paired. What you send it is said \
                         to main, and main's replies are sent back to you there."
@@ -1734,7 +1734,13 @@ impl Live {
             alive,
         });
         vec![Tagged::system(EventKind::Alert {
-            severity: Severity::Info,
+            // Something for the user to do is shown in the conversation;
+            // a plain "connected" is not.
+            severity: if unpaired {
+                Severity::Warn
+            } else {
+                Severity::Info
+            },
             text,
         })]
     }

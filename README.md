@@ -98,7 +98,7 @@ cd Conscious-Mind
 
 The script builds a release binary, copies it to `~/.local/bin/conscious`, and runs `conscious check`, which reports what your machine has and which model would be used. It never uses `sudo` and installs nothing else. The first build downloads the ONNX Runtime library and takes a few minutes. On first run, a small embedding model (about 65 MB) is downloaded to `~/.cache/conscious/models`; it runs locally and nothing you embed leaves your machine.
 
-**The first start checks that a model really answers.** `conscious` brings no model of its own: it works through Claude Code or Codex (or a running local server, or an OpenAI / OpenRouter model you name). The first time you run it, it says so, shows what it found on your machine, and sends one small request to make sure the model answers, before anything else starts. If none does, it stops and tells you how to sign in.
+**The first start sets things up, once.** It checks that a model really answers, then offers to connect a Telegram bot (optional; Enter skips it). `conscious` brings no model of its own: it works through Claude Code or Codex (or a running local server, or an OpenAI / OpenRouter model you name). The first time you run it, it says so, shows what it found on your machine, and sends one small request to make sure the model answers, before anything else starts. If none does, it stops and tells you how to sign in.
 
 `PREFIX=/some/dir ./install.sh` installs elsewhere. `./install.sh --uninstall` removes the command and keeps your data.
 
@@ -135,6 +135,7 @@ Useful commands:
 
 ```sh
 conscious check            # what this machine has, and which model would be used
+conscious telegram         # connect a Telegram bot and pair it with your account
 conscious status           # whether it is running in the background, and on what
 conscious stop [--force]   # end the background process
 conscious lessons          # what it has learned, and how each lesson has fared
@@ -159,9 +160,19 @@ An `OPENAI_API_KEY` or `OPENROUTER_API_KEY` entered this way is used for that ba
 
 You can talk to the main conversation from Telegram.
 
+The first time you run `conscious` it offers this as an optional last step of setting up. To do it at any other time, run:
+
+```sh
+conscious telegram
+```
+
+It walks you through three steps:
+
 1. In Telegram, message [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the token it gives you.
-2. In conscious, press `K`, name the secret `TELEGRAM_BOT_TOKEN`, and paste the token as its value.
-3. conscious shows a line such as `/pair 482913`. Send exactly that to your bot from your own Telegram account.
+2. Paste the token when asked. It is not shown as you type, is checked with Telegram, and is stored as a secret that no model sees.
+3. It prints a link to your bot and a line such as `/pair 482913`. Send exactly that to the bot from your own Telegram account, and it is paired.
+
+If conscious was already running in the background, run `conscious stop` and then `conscious` so that it picks the bot up. (You can also enter the token inside conscious: press `K` and name the secret `TELEGRAM_BOT_TOKEN`; the pairing line then appears in the conversation.)
 
 From then on:
 
