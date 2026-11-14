@@ -1,0 +1,20 @@
+[package]
+name = "conscious"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastembed = { version = "7.7.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls", "onnx"] }
+ratatui = "0.30.2"
+rhai = { version = "1.27.0", features = ["sync"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = "3.5.2"
+
+# `cargo run` is the one command people use, so make the default build fast
+# to run: dependencies fully optimised, our own code lightly.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,16 @@
+# Build output
+/target
+
+# Local tool settings and scratch output; nothing here belongs to the project
+.claude/
+graphify-out/
+*.log
+*.bak
+*.swp
+.DS_Store
+
+# Secrets never belong in the repository
+.env
+.env.*
+*.pem
+*.key
