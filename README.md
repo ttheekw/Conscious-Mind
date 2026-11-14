@@ -163,7 +163,13 @@ You can talk to the main conversation from Telegram.
 2. In conscious, press `K`, name the secret `TELEGRAM_BOT_TOKEN`, and paste the token as its value.
 3. conscious shows a line such as `/pair 482913`. Send exactly that to your bot from your own Telegram account.
 
-From then on, what you send the bot is said to main, and main's replies and the results of its branches come back to you there. Only the account that sent the pairing code is heard; group chats are ignored. Nothing can be approved and no secret can be entered from Telegram: those wait for you at the screen, and the bot only tells you something is waiting. While a bot is connected, the background process keeps running.
+From then on:
+
+- **Messages.** What you send the bot is said to main. Main's replies, and the results of its branches, come back to you there.
+- **Approvals.** When a call needs your approval, the bot sends it with **Approve** and **Deny** buttons. Pressing one decides it, the same as at the screen, and the message then shows what was decided.
+- **Photos, video, audio, voice notes and files.** Send one (up to 20 MB, Telegram's limit for bots) and it is saved in the project folder under `telegram-inbox/`, and main is told where it is and what you wrote with it. The models conscious uses take text only, so the agent can work on the file with its tools (convert it, read its metadata, run a script over it) but cannot look at a picture or listen to a recording.
+
+Only the account that sent the pairing code is heard, and only its button presses count; group chats are ignored. Two things can never be done from Telegram and wait for you at the screen: entering a secret, and approving a change to what the agent itself is allowed to do. While a bot is connected, the background process keeps running.
 
 What main says to you over Telegram passes through Telegram's servers.
 

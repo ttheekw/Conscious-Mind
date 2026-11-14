@@ -1069,3 +1069,192 @@ fn readme_screen() {
     assert!(screen.contains("merged into main"), "{screen}");
     assert!(screen.contains("17 times 23 is 391"), "{screen}");
 }
+
+/// The events a task's tab shows in each of its three views (ACTIVITY, RAW
+/// EVENTS, KNOWLEDGE), with the ACTIVITY screen as text.
+fn tab_views(app: &mut App, task: u32) -> (Vec<Vec<usize>>, String) {
+    app.select_task(Some(task));
+    assert_eq!(app.task_sel, Some(task));
+    let mut views = Vec::new();
+    let mut activity = String::new();
+    for (i, view) in ['1', '2', '3'].into_iter().enumerate() {
+        key(app, KeyCode::Char(view));
+        let screen = text(&render(app));
+        if i == 0 {
+            activity = screen;
+        }
+        views.push(app.visible_center.clone());
+    }
+    key(app, KeyCode::Char('1'));
+    (views, activity)
+}
+
+#[test]
+fn a_branch_keeps_what_it_showed_after_a_visit_to_main() {
+    use crate::event::{EventKind as E, Risk, Severity, TaskState};
+    let mut app = with_tasks();
+
+    // Branch 2 is still running: it has said what it is about to do, taken
+    // a step, and is writing again.
+    app.apply_in(
+        Some(2),
+        E::Thought {
+            agent: 0,
+            text: "Reading the tide tables first.".into(),
+        },
+    );
+    app.apply_in(
+        Some(2),
+        E::ToolRequested {
+            id: 7,
+            agent: 0,
+            tool: "read_file".into(),
+            args: "tides.md".into(),
+            risk: Risk::Low,
+            needs_approval: false,
+            policy: "read-only".into(),
+        },
+    );
+    app.apply_in(
+        Some(2),
+        E::Alert {
+            severity: Severity::Warn,
+            text: "tides.md is longer than what fits".into(),
+        },
+    );
+    app.set_draft(2, "Design settled: springs follow the moon".into());
+
+    let (running_before, screen) = tab_views(&mut app, 2);
+    assert!(
+        screen.contains("explain how spring tides differ"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Reading the tide tables first."),
+        "{screen}"
+    );
+    assert!(screen.contains("tides.md is longer"), "{screen}");
+    assert!(
+        screen.contains("Design settled: springs follow"),
+        "{screen}"
+    );
+    // The finished branch, before the visit.
+    let (done_before, _) = tab_views(&mut app, 1);
+    app.select_task(Some(2));
+
+    // To main, where the conversation goes on while the branch works: its
+    // model call ends (what it was writing becomes a step of its own) and
+    // it takes another step.
+    key(&mut app, KeyCode::Char('0'));
+    assert_eq!(app.task_sel, Some(0));
+    app.apply_in(
+        Some(0),
+        E::Message {
+            agent: None,
+            text: "and how is the tide branch doing?".into(),
+        },
+    );
+    app.set_draft(2, String::new());
+    app.apply_in(
+        Some(2),
+        E::Thought {
+            agent: 0,
+            text: "Design settled: springs follow the moon".into(),
+        },
+    );
+    app.apply_in(
+        Some(2),
+        E::ToolRequested {
+            id: 8,
+            agent: 0,
+            tool: "bash".into(),
+            args: "wc -l tides.md".into(),
+            risk: Risk::Low,
+            needs_approval: false,
+            policy: "read-only".into(),
+        },
+    );
+    app.apply_in(
+        Some(0),
+        E::Message {
+            agent: Some(0),
+            text: "Still working on it.".into(),
+        },
+    );
+    // Main's activity is the conversation only: nothing of the branch's.
+    let main = text(&render(&mut app));
+    assert!(main.contains("Still working on it."), "{main}");
+    assert!(!main.contains("Reading the tide tables first."), "{main}");
+    assert!(!main.contains("Design settled"), "{main}");
+    assert!(!main.contains("wc -l tides.md"), "{main}");
+
+    // Back in the branch: everything it showed before is still there.
+    let (running_after, screen) = tab_views(&mut app, 2);
+    for (before, after) in running_before.iter().zip(&running_after) {
+        for idx in before {
+            assert!(after.contains(idx), "event {idx} is gone:\n{screen}");
+        }
+    }
+    for expected in [
+        "explain how spring tides differ",
+        "Reading the tide tables first.",
+        "tides.md is longer",
+        "Design settled: springs follow",
+    ] {
+        assert!(
+            screen.contains(expected),
+            "missing {expected:?} in:\n{screen}"
+        );
+    }
+    // The finished branch is as it was.
+    let (done_after, _) = tab_views(&mut app, 1);
+    assert_eq!(done_before, done_after);
+
+    // The branch ends and merges; after another visit to main its tab
+    // still has all of it, and the reply.
+    app.apply_in(
+        Some(2),
+        E::Message {
+            agent: Some(0),
+            text: "Spring tides come twice a month.".into(),
+        },
+    );
+    app.apply_in(
+        Some(2),
+        E::TaskUpdate {
+            state: TaskState::Done,
+            note: "answered after 3 model calls".into(),
+        },
+    );
+    app.apply_in(
+        Some(0),
+        E::Merged {
+            branch: 2,
+            title: "explain how spring tides differ from neap tides".into(),
+            result: "Spring tides come twice a month.".into(),
+            ok: true,
+        },
+    );
+    let (ended_before, _) = tab_views(&mut app, 2);
+    key(&mut app, KeyCode::Char('0'));
+    let main = text(&render(&mut app));
+    assert!(main.contains("Spring tides come twice a month."), "{main}");
+    assert!(!main.contains("Reading the tide tables first."), "{main}");
+    let (ended_after, screen) = tab_views(&mut app, 2);
+    assert_eq!(ended_before, ended_after);
+    for (before, after) in running_after.iter().zip(&ended_after) {
+        for idx in before {
+            assert!(after.contains(idx), "event {idx} is gone:\n{screen}");
+        }
+    }
+    for expected in [
+        "Reading the tide tables first.",
+        "Design settled: springs follow",
+        "Spring tides come twice a month.",
+    ] {
+        assert!(
+            screen.contains(expected),
+            "missing {expected:?} in:\n{screen}"
+        );
+    }
+}

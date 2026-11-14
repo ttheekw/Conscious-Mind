@@ -13,7 +13,7 @@
 //! run at once and the rest wait their turn in the order they were asked;
 //! a scheduled job is a task like any other and takes a slot.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -53,6 +53,8 @@ pub const MAX_RUNNING: usize = 3;
 /// The main conversation: the one task that is always there. Every message
 /// goes to it; other tasks are branches it opened, or runs of a routine.
 pub const MAIN: u32 = 0;
+/// The folder, in the project, where files sent over Telegram are saved.
+pub const TELEGRAM_INBOX: &str = "telegram-inbox";
 /// What main is told about itself.
 const MAIN_BRIEF: &str = "You are the main conversation with the user: one continuous thread \
     that keeps going. Here you answer, look things up and decide; you cannot change files \
@@ -117,6 +119,9 @@ enum Update {
         problem: String,
         change: String,
     },
+    /// Something that arrived from outside the screen (a file sent over
+    /// Telegram, once saved), to be said to main.
+    Heard(String),
     /// Main asked for a branch to be opened.
     BranchAsked {
         title: String,
@@ -139,9 +144,35 @@ struct Bridge {
     /// The code that makes whoever sends it the bot's owner.
     code: String,
     heard: Receiver<crate::telegram::Incoming>,
-    out: Sender<(i64, String)>,
+    out: Sender<Out2>,
+    /// The bot itself, for fetching a file the owner sent.
+    bot: Arc<dyn crate::telegram::Bot>,
+    /// Calls put to the owner with buttons and not yet decided: the call,
+    /// and what the message said.
+    pending: HashMap<u32, String>,
     /// Cleared when the bridge goes, so its reader thread ends.
     alive: Arc<AtomicBool>,
+}
+
+/// Something to send over Telegram.
+enum Out2 {
+    Say(i64, String),
+    /// A call that needs approval, with Approve and Deny under it.
+    Ask {
+        chat: i64,
+        tool: u32,
+        text: String,
+    },
+    /// The call was decided: its message says so and loses its buttons.
+    Settle {
+        tool: u32,
+        text: String,
+    },
+    /// A pressed button is acknowledged.
+    Pressed {
+        button: String,
+        note: String,
+    },
 }
 
 impl Drop for Bridge {
@@ -1273,6 +1304,10 @@ impl Live {
                         tagged.extend(self.merge(branch, title, answer));
                     }
                 }
+                // A file sent over Telegram has been saved: main is told.
+                Update::Heard(text) => {
+                    tagged.extend(self.say(text));
+                }
                 Update::BranchAsked { title, task } => {
                     tagged.extend(self.branch(&title, task));
                 }
@@ -1612,8 +1647,9 @@ impl Live {
         let code = crate::telegram::new_code();
         let alive = Arc::new(AtomicBool::new(true));
         let (heard_tx, heard) = mpsc::channel();
-        let (out, out_rx) = mpsc::channel::<(i64, String)>();
+        let (out, out_rx) = mpsc::channel::<Out2>();
         // Reading: one long request after another.
+        let files = bot.clone();
         let (reader, living, report) = (bot.clone(), alive.clone(), self.out(None));
         let mut after = pairing.after;
         thread::spawn(move || {
@@ -1648,13 +1684,32 @@ impl Live {
             }
         });
         // Sending.
-        let report = self.out(None);
+        let (sender, report) = (bot.clone(), self.out(None));
         thread::spawn(move || {
-            for (chat, text) in out_rx {
-                if let Err(why) = bot.send(chat, &text) {
+            // Where each call's question was sent: (chat, message).
+            let mut asked: HashMap<u32, (i64, i64)> = HashMap::new();
+            for item in out_rx {
+                let sent = match item {
+                    Out2::Say(chat, text) => sender.send(chat, &text),
+                    Out2::Ask { chat, tool, text } => {
+                        let buttons = [
+                            ("Approve".to_string(), crate::telegram::decision(tool, true)),
+                            ("Deny".to_string(), crate::telegram::decision(tool, false)),
+                        ];
+                        sender.ask(chat, &text, &buttons).map(|message| {
+                            asked.insert(tool, (chat, message));
+                        })
+                    }
+                    Out2::Settle { tool, text } => match asked.remove(&tool) {
+                        Some((chat, message)) => sender.settle(chat, message, &text),
+                        None => Ok(()),
+                    },
+                    Out2::Pressed { button, note } => sender.pressed(&button, &note),
+                };
+                if let Err(why) = sent {
                     report.send(Update::Event(EventKind::Alert {
                         severity: Severity::Warn,
-                        text: format!("Telegram: a reply could not be sent: {why}"),
+                        text: format!("Telegram: a message could not be sent: {why}"),
                     }));
                 }
             }
@@ -1674,6 +1729,8 @@ impl Live {
             code,
             heard,
             out,
+            bot: files,
+            pending: HashMap::new(),
             alive,
         });
         vec![Tagged::system(EventKind::Alert {
@@ -1682,28 +1739,44 @@ impl Live {
         })]
     }
 
-    /// Takes what the bot has heard: pairs, or says it to main.
+    /// Takes what the bot has heard: pairs, says it to main, decides a
+    /// call the owner pressed a button on, or fetches a file they sent.
     fn telegram_heard(&mut self) -> Vec<Tagged> {
         use crate::telegram::Heard;
         let Some(bridge) = &mut self.telegram else {
             return Vec::new();
         };
+        // First what each message is, by the rules; then acting on it,
+        // which needs the rest of the feed.
         let messages: Vec<_> = bridge.heard.try_iter().collect();
-        let mut events = Vec::new();
+        let mut heard = Vec::new();
         for message in messages {
+            bridge.pairing.after = bridge.pairing.after.max(message.update);
+            let what = crate::telegram::hear(&bridge.pairing, &bridge.code, &message);
+            if let Heard::Pair(owner) = &what {
+                bridge.pairing.owner = Some(*owner);
+            }
+            heard.push((message.chat, what));
+        }
+        if !heard.is_empty() {
+            bridge.save();
+        }
+        let mut events = Vec::new();
+        for (chat, what) in heard {
             let Some(bridge) = &mut self.telegram else {
                 break;
             };
-            bridge.pairing.after = bridge.pairing.after.max(message.update);
-            let heard = crate::telegram::hear(&bridge.pairing, &bridge.code, &message);
-            match heard {
-                Heard::Pair(owner) => {
-                    bridge.pairing.owner = Some(owner);
-                    let _ = bridge.out.send((
-                        message.chat,
+            match what {
+                Heard::Nothing => {}
+                Heard::Reply(text) => {
+                    let _ = bridge.out.send(Out2::Say(chat, text));
+                }
+                Heard::Pair(_) => {
+                    let _ = bridge.out.send(Out2::Say(
+                        chat,
                         "Paired. What you send here is said to conscious's main conversation, \
-                         and its replies come back here. Anything that needs your approval \
-                         waits on its screen."
+                         and its replies come back here. A call that needs your approval comes \
+                         with Approve and Deny buttons."
                             .into(),
                     ));
                     events.push(Tagged::system(EventKind::Alert {
@@ -1713,65 +1786,169 @@ impl Live {
                             .into(),
                     }));
                 }
-                Heard::Reply(text) => {
-                    let _ = bridge.out.send((message.chat, text));
+                Heard::Say(text) => events.extend(self.say(text)),
+                Heard::Decide {
+                    tool,
+                    approve,
+                    button,
+                } => {
+                    // Only a call that was put to them, and is still open.
+                    let open = bridge.pending.contains_key(&tool);
+                    let _ = bridge.out.send(Out2::Pressed {
+                        button,
+                        note: match (open, approve) {
+                            (false, _) => "This is no longer waiting.".into(),
+                            (true, true) => "Approved.".into(),
+                            (true, false) => "Denied.".into(),
+                        },
+                    });
+                    if open {
+                        events.push(Tagged::system(EventKind::Alert {
+                            severity: Severity::Info,
+                            text: format!(
+                                "Telegram: call #{tool} was {} from your Telegram account.",
+                                if approve { "approved" } else { "denied" }
+                            ),
+                        }));
+                        events.extend(self.handle(Command::Decide { id: tool, approve }));
+                    }
                 }
-                Heard::Nothing => {}
-                Heard::Say(text) => {
-                    bridge.save();
-                    events.extend(self.say(text));
-                    continue;
+                Heard::File { media, caption } => {
+                    let root = self.guard.as_ref().map(|g| g.root().to_path_buf());
+                    let (bot, out, heard) =
+                        (bridge.bot.clone(), bridge.out.clone(), self.out(None));
+                    // Fetched on a thread of its own: a video takes a while.
+                    thread::spawn(move || {
+                        let saved = root
+                            .ok_or_else(|| {
+                                "conscious has no folder to keep files in this session".to_string()
+                            })
+                            .and_then(|root| {
+                                if media.size > crate::telegram::MAX_FILE {
+                                    return Err(
+                                        "it is larger than the 20 MB a bot may fetch".to_string()
+                                    );
+                                }
+                                let (bytes, path) = bot.fetch(&media.file)?;
+                                let folder = root.join(TELEGRAM_INBOX);
+                                std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+                                let name =
+                                    crate::telegram::file_name(&media, &path, crate::learn::now());
+                                std::fs::write(folder.join(&name), &bytes)
+                                    .map_err(|e| e.to_string())?;
+                                Ok((name, bytes.len()))
+                            });
+                        match saved {
+                            Ok((name, size)) => heard.send(Update::Heard(format!(
+                                "[Sent from Telegram: a {}, saved as {TELEGRAM_INBOX}/{name} \
+                                 ({:.1} MB). You are given text only, so you cannot see or hear \
+                                 it; work on the file with your tools if that is needed, and \
+                                 say so plainly if what is asked needs it to be seen or heard.]{}",
+                                media.kind,
+                                size as f64 / 1_048_576.0,
+                                if caption.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("\n{caption}")
+                                }
+                            ))),
+                            Err(why) => {
+                                let _ = out.send(Out2::Say(
+                                    chat,
+                                    format!("That {} could not be taken: {why}.", media.kind),
+                                ));
+                            }
+                        }
+                    });
                 }
             }
-            bridge.save();
         }
         events
     }
 
-    /// Sends the owner what main said, what a branch brought back, and a
-    /// word when something is waiting for them at the screen.
-    fn telegram_tell(&self, events: &[Tagged]) {
-        let Some(bridge) = &self.telegram else {
+    /// Sends the owner what main said and what a branch brought back, puts
+    /// a call that needs approval to them with buttons, and says when
+    /// something can only be answered at the screen.
+    fn telegram_tell(&mut self, events: &[Tagged]) {
+        let Some(bridge) = &mut self.telegram else {
             return;
         };
         let Some(owner) = bridge.pairing.owner else {
             return;
         };
+        // Anything secret is taken out before it leaves the machine.
+        let clean = |text: &str| crate::guard::redact(text);
         for event in events {
-            let text = match &event.kind {
+            let item = match &event.kind {
                 EventKind::Message {
                     agent: Some(_),
                     text,
-                } if event.task == Some(MAIN) => text.clone(),
+                } if event.task == Some(MAIN) => Out2::Say(owner, clean(text)),
                 EventKind::Merged {
                     branch,
                     title,
                     result,
                     ok,
-                } => {
-                    if *ok {
+                } => Out2::Say(
+                    owner,
+                    clean(&if *ok {
                         format!("Branch #{branch} ({title}) has ended:\n\n{result}")
                     } else {
                         format!("Branch #{branch} ({title}) ended without an answer.")
-                    }
-                }
+                    }),
+                ),
                 EventKind::ToolRequested {
+                    id,
                     tool,
                     args,
+                    risk,
                     needs_approval: true,
+                    policy,
                     ..
-                } => format!(
-                    "Waiting for your approval at the screen: {tool} {}",
-                    args.lines().next().unwrap_or_default()
-                ),
-                EventKind::SecretAsked { name, .. } => format!(
-                    "Waiting for you to type the secret {name} at the screen. Do not send \
-                     it here."
+                } => {
+                    let what: String = args.chars().take(800).collect();
+                    let text = clean(&format!(
+                        "Approval needed · risk {}\n\n{tool}: {what}\n\nWhy it asks: {policy}",
+                        risk.label().to_lowercase()
+                    ));
+                    // What changes the agent's own limits is decided at
+                    // the screen, where all of it can be read.
+                    if crate::telegram::SCREEN_ONLY.contains(&tool.as_str()) {
+                        Out2::Say(
+                            owner,
+                            format!("{text}\n\nThis one can only be decided at the screen."),
+                        )
+                    } else {
+                        bridge.pending.insert(*id, text.clone());
+                        Out2::Ask {
+                            chat: owner,
+                            tool: *id,
+                            text,
+                        }
+                    }
+                }
+                EventKind::ToolDecision { id, approved, by } => {
+                    let Some(text) = bridge.pending.remove(id) else {
+                        continue;
+                    };
+                    Out2::Settle {
+                        tool: *id,
+                        text: format!(
+                            "{text}\n\n{} (by {by}).",
+                            if *approved { "Approved" } else { "Denied" }
+                        ),
+                    }
+                }
+                EventKind::SecretAsked { name, .. } => Out2::Say(
+                    owner,
+                    format!(
+                        "Waiting for you to type the secret {name} at the screen. Do not \
+                         send it here."
+                    ),
                 ),
                 _ => continue,
             };
-            // Anything secret is taken out before it leaves the machine.
-            let _ = bridge.out.send((owner, crate::guard::redact(&text)));
+            let _ = bridge.out.send(item);
         }
     }
 
@@ -4365,22 +4542,51 @@ mod tests {
     struct FakeBot {
         incoming: Mutex<VecDeque<crate::telegram::Incoming>>,
         sent: Mutex<Vec<(i64, String)>>,
+        /// Questions sent with buttons: (the text, what each button carries).
+        asked: Mutex<Vec<(String, Vec<String>)>>,
+        /// (message, what it was changed to say).
+        settled: Mutex<Vec<(i64, String)>>,
+        /// The note each pressed button was acknowledged with.
+        notes: Mutex<Vec<String>>,
         update: AtomicU32,
     }
 
     impl FakeBot {
+        fn incoming(&self, from: i64, private: bool, text: &str) -> crate::telegram::Incoming {
+            crate::telegram::Incoming {
+                update: i64::from(self.update.fetch_add(1, Ordering::Relaxed)) + 1,
+                chat: from,
+                from,
+                private,
+                text: text.into(),
+                media: None,
+                button: None,
+            }
+        }
+
         fn hears(&self, from: i64, private: bool, text: &str) {
-            let update = i64::from(self.update.fetch_add(1, Ordering::Relaxed)) + 1;
-            self.incoming
-                .lock()
-                .unwrap()
-                .push_back(crate::telegram::Incoming {
-                    update,
-                    chat: from,
-                    from,
-                    private,
-                    text: text.into(),
-                });
+            let message = self.incoming(from, private, text);
+            self.incoming.lock().unwrap().push_back(message);
+        }
+
+        fn presses(&self, from: i64, data: &str) {
+            let mut message = self.incoming(from, true, "");
+            message.button = Some(crate::telegram::Button {
+                id: "press".into(),
+                data: data.into(),
+            });
+            self.incoming.lock().unwrap().push_back(message);
+        }
+
+        fn sends_file(&self, from: i64, kind: &str, name: &str, caption: &str) {
+            let mut message = self.incoming(from, true, caption);
+            message.media = Some(crate::telegram::Media {
+                kind: kind.into(),
+                file: "file-1".into(),
+                name: name.into(),
+                size: 11,
+            });
+            self.incoming.lock().unwrap().push_back(message);
         }
 
         fn sent(&self) -> Vec<(i64, String)> {
@@ -4406,6 +4612,162 @@ mod tests {
             self.sent.lock().unwrap().push((chat, text.to_string()));
             Ok(())
         }
+
+        fn ask(&self, _: i64, text: &str, buttons: &[(String, String)]) -> Result<i64, String> {
+            let mut asked = self.asked.lock().unwrap();
+            asked.push((
+                text.to_string(),
+                buttons.iter().map(|(_, data)| data.clone()).collect(),
+            ));
+            Ok(100 + asked.len() as i64)
+        }
+
+        fn settle(&self, _: i64, message: i64, text: &str) -> Result<(), String> {
+            self.settled
+                .lock()
+                .unwrap()
+                .push((message, text.to_string()));
+            Ok(())
+        }
+
+        fn pressed(&self, _: &str, note: &str) -> Result<(), String> {
+            self.notes.lock().unwrap().push(note.to_string());
+            Ok(())
+        }
+
+        fn fetch(&self, _: &str) -> Result<(Vec<u8>, String), String> {
+            Ok((b"image bytes".to_vec(), "photos/file_7.jpg".to_string()))
+        }
+    }
+
+    #[test]
+    fn a_call_is_approved_from_telegram_with_a_button_and_a_file_sent_there_is_saved() {
+        use crate::provider::testing::Queue;
+        let root =
+            std::env::temp_dir().join(format!("conscious-live-telegram-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let core = Queue::new(
+            "core",
+            &[
+                r#"CALL write_file {"path": "note.txt", "content": "hello"}"#,
+                "Written.",
+            ],
+        );
+        let guard = Arc::new(Guard::new(&root).unwrap());
+        let mut live = Live::new(Arc::new(Router::single(Arc::new(core)))).with_guard(Some(guard));
+        live.poll();
+        let bot = Arc::new(FakeBot::default());
+        live.connect_telegram(bot.clone(), None);
+        live.telegram.as_mut().unwrap().pairing.owner = Some(7);
+        let wait = |live: &mut Live, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(Instant::now() < deadline, "not seen within 5 s");
+                live.poll();
+                thread::sleep(Duration::from_millis(3));
+            }
+        };
+
+        // A branch wants to write a file: the owner is asked, with buttons.
+        ask(&mut live, "write the note".into());
+        wait(&mut live, &|| !bot.asked.lock().unwrap().is_empty());
+        let (text, buttons) = bot.asked.lock().unwrap()[0].clone();
+        assert!(text.starts_with("Approval needed"), "{text}");
+        assert!(
+            text.contains("write_file") && text.contains("note.txt"),
+            "{text}"
+        );
+        let id: u32 = buttons[0].strip_prefix("ok:").unwrap().parse().unwrap();
+        assert_eq!(buttons, [format!("ok:{id}"), format!("no:{id}")]);
+        assert!(!root.join("note.txt").exists());
+
+        // Someone else pressing Approve decides nothing.
+        bot.presses(8, &format!("ok:{id}"));
+        // The owner pressing it does: the call runs, the press is
+        // acknowledged, and the message says what was decided.
+        bot.presses(7, &format!("ok:{id}"));
+        wait(&mut live, &|| !bot.settled.lock().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(*bot.notes.lock().unwrap(), ["Approved."]);
+        let (message, settled) = bot.settled.lock().unwrap()[0].clone();
+        assert_eq!(message, 101);
+        assert!(settled.ends_with("Approved (by you)."), "{settled}");
+        // Pressing again on a call that is over changes nothing.
+        bot.presses(7, &format!("no:{id}"));
+        wait(&mut live, &|| bot.notes.lock().unwrap().len() == 2);
+        assert_eq!(bot.notes.lock().unwrap()[1], "This is no longer waiting.");
+
+        // A call that widens the agent's own access is put to the owner
+        // without buttons: it is decided at the screen only.
+        live.telegram_tell(&[Tagged {
+            task: Some(1),
+            kind: EventKind::ToolRequested {
+                id: 900,
+                agent: 0,
+                tool: "access".into(),
+                args: "set_mode trusted".into(),
+                risk: crate::event::Risk::High,
+                needs_approval: true,
+                policy: "widens what the agent may do".into(),
+            },
+        }]);
+        wait(&mut live, &|| {
+            bot.sent()
+                .iter()
+                .any(|(_, text)| text.ends_with("can only be decided at the screen."))
+        });
+        assert_eq!(bot.asked.lock().unwrap().len(), 1);
+
+        // A photo the owner sends is saved in the project and main is told
+        // where; one from anyone else is not fetched.
+        bot.sends_file(8, "photo", "", "from a stranger");
+        bot.sends_file(7, "photo", "", "what is on the whiteboard?");
+        wait(&mut live, &|| {
+            live_main_thread(&root).is_some_and(|saved| saved.len() == 1)
+        });
+        let saved = live_main_thread(&root).unwrap();
+        assert!(saved[0].ends_with("-photo.jpg"), "{saved:?}");
+        assert_eq!(
+            std::fs::read(root.join(TELEGRAM_INBOX).join(&saved[0])).unwrap(),
+            b"image bytes"
+        );
+        let told_main = |live: &Live| {
+            live.tasks.iter().any(|t| {
+                t.id == MAIN
+                    && t.thread
+                        .iter()
+                        .any(|m| m.content.contains("what is on the whiteboard?"))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !told_main(&live) {
+            assert!(Instant::now() < deadline, "main was not told of the photo");
+            live.poll();
+            thread::sleep(Duration::from_millis(3));
+        }
+        let main = live.tasks.iter().find(|t| t.id == MAIN).unwrap();
+        let told = &main.thread[0].content;
+        assert!(
+            told.contains(&format!("a photo, saved as {TELEGRAM_INBOX}/{}", saved[0])),
+            "{told}"
+        );
+        assert!(told.contains("you cannot see or hear it"), "{told}");
+        assert!(!told.contains("from a stranger"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The files saved from Telegram under `root`, if the folder exists.
+    fn live_main_thread(root: &std::path::Path) -> Option<Vec<String>> {
+        let mut names: Vec<String> = std::fs::read_dir(root.join(TELEGRAM_INBOX))
+            .ok()?
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        Some(names)
     }
 
     #[test]
