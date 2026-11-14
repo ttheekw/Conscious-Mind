@@ -890,3 +890,99 @@ fn main_keeps_going_and_each_branch_has_a_tab_and_merges_back() {
     key(&mut app, KeyCode::Char('X'));
     assert!(matches!(app.outbox[2], Command::Stop { task: 2 }));
 }
+
+/// The screen shown in the README: main with a merged branch, two branches
+/// at work, real-looking memories and a reply being written. Written out
+/// with `SNAPSHOT_HTML=1 cargo test readme_screen`.
+#[test]
+fn readme_screen() {
+    use crate::event::{ContextSection, EventKind as E, MemKind, MemoryNode};
+    let mut app = with_tasks();
+    app.live = true;
+    let node = |id: u32, kind: MemKind, label: &str| MemoryNode {
+        id,
+        kind,
+        label: label.into(),
+        text: String::new(),
+        about: String::new(),
+    };
+    app.apply(E::MemoryIndexed {
+        nodes: vec![
+            node(3, MemKind::Procedural, "replies should be short"),
+            node(5, MemKind::Semantic, "the tests are run with pytest"),
+            node(8, MemKind::Episodic, "counted the python files"),
+            node(11, MemKind::Semantic, "config lives in conf.d"),
+            node(14, MemKind::Procedural, "rule: verify after every change"),
+            node(17, MemKind::Episodic, "wrote the todo tool"),
+            node(21, MemKind::Semantic, "spring tides follow the moon"),
+            node(26, MemKind::Episodic, "tidied the notes folder"),
+        ],
+    });
+    app.apply_in(
+        Some(0),
+        E::ModelCall {
+            agent: 0,
+            model: "claude-code:sonnet".into(),
+            tokens_in: 4_180,
+            cached_in: 0,
+            tokens_out: 312,
+            latency_ms: 2_400,
+        },
+    );
+    app.apply_in(
+        Some(0),
+        E::Context {
+            window: 200_000,
+            sections: vec![
+                ContextSection {
+                    name: "system".into(),
+                    tokens: 1_900,
+                    why: "harness instructions".into(),
+                },
+                ContextSection {
+                    name: "memory".into(),
+                    tokens: 240,
+                    why: "what is always kept in mind".into(),
+                },
+                ContextSection {
+                    name: "knowledge".into(),
+                    tokens: 1_100,
+                    why: "passages the lookup found".into(),
+                },
+                ContextSection {
+                    name: "task".into(),
+                    tokens: 620,
+                    why: "this conversation".into(),
+                },
+            ],
+        },
+    );
+    app.apply_in(
+        Some(0),
+        E::Thought {
+            agent: 0,
+            text: "The count is back from its branch. The tide question needs facts I do not have, so that branch is researching.".into(),
+        },
+    );
+    app.apply_in(
+        Some(0),
+        E::Message {
+            agent: None,
+            text: "while those run: what is 17 times 23?".into(),
+        },
+    );
+    app.apply_in(
+        Some(0),
+        E::TaskUpdate {
+            state: crate::event::TaskState::Working,
+            note: "working, with claude-code:sonnet".into(),
+        },
+    );
+    app.set_draft(0, "17 times 23 is **391**. The tide branch is still".into());
+    let buf = render(&mut app);
+    write_html("readme-main", &buf);
+    let screen = text(&buf);
+    assert!(screen.contains("0 MAIN"), "{screen}");
+    assert!(screen.contains("merged into main"), "{screen}");
+    assert!(screen.contains("17 times 23 is 391"), "{screen}");
+}

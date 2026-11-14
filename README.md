@@ -2,6 +2,10 @@
 
 A self-learning agent harness in Rust. You talk to one conversation that keeps going. When something is real work it opens a branch that runs by itself and merges the result back. It learns from how its work went and from your feedback, and it can rewrite its own code, including its own Rust source, behind a gate.
 
+![The conscious terminal screen: the main conversation with a merged branch result, two branches at work, the memory map and the context given to the model](docs/screen.png)
+
+*The main conversation. A branch has merged its result back, two more are at work, and a reply is being written. Rendered from the interface code with example data.*
+
 **Status: working prototype.** One developer, about 250 tests. Read [What is not done](#what-is-not-done) before relying on it.
 
 ```sh

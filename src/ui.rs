@@ -2584,7 +2584,10 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     );
     spans.push(Span::styled(" ❯ ", bold(if focused { NEON } else { DIM })));
     if app.input.is_empty() && !focused {
-        spans.push(Span::styled("i reply here · n new task", fg(DIM)));
+        spans.push(Span::styled(
+            "i to type · it goes to main, which branches when it is real work",
+            fg(DIM),
+        ));
     } else {
         spans.push(Span::styled(app.input.clone(), fg(TEXT)));
         if focused {
@@ -2598,7 +2601,7 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     let hint = if focused {
         "⏎ send  ╱  esc leave "
     } else {
-        "0 tasks ╱ [ ] tabs ╱ 1-3 views ╱ ⏎ open ╱ a/d approve ╱ X stop ╱ g lookup ╱ ? help ╱ q quit "
+        "0 main ╱ b branches ╱ [ ] tabs ╱ 1-3 views ╱ a/d approve ╱ X stop ╱ m memory ╱ ? help ╱ q quit "
     };
     if area.width as usize > width(hint) + 44 {
         f.render_widget(
