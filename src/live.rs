@@ -150,6 +150,8 @@ struct Bridge {
     /// Calls put to the owner with buttons and not yet decided: the call,
     /// and what the message said.
     pending: HashMap<u32, String>,
+    /// When the pairing code was last said again on the screen.
+    reminded: Option<Instant>,
     /// Cleared when the bridge goes, so its reader thread ends.
     alive: Arc<AtomicBool>,
 }
@@ -1614,6 +1616,22 @@ impl Live {
         self.telegram.is_some()
     }
 
+    /// How the Telegram bot stands, in a line, for `conscious status`. The
+    /// pairing code is in it while nobody is paired, so it can always be
+    /// found again.
+    pub fn telegram_state(&self) -> String {
+        match &self.telegram {
+            None => String::new(),
+            Some(bridge) if bridge.pairing.owner.is_some() => {
+                "connected and paired with your account".into()
+            }
+            Some(bridge) => format!(
+                "connected, not paired: send your bot the message /pair {}",
+                bridge.code
+            ),
+        }
+    }
+
     /// Connects the Telegram bot if the user has given its token.
     fn start_telegram(&mut self) -> Vec<Tagged> {
         let Some(token) = crate::secrets::get(crate::telegram::TOKEN) else {
@@ -1731,6 +1749,7 @@ impl Live {
             out,
             bot: files,
             pending: HashMap::new(),
+            reminded: None,
             alive,
         });
         vec![Tagged::system(EventKind::Alert {
@@ -1776,6 +1795,24 @@ impl Live {
                 Heard::Nothing => {}
                 Heard::Reply(text) => {
                     let _ = bridge.out.send(Out2::Say(chat, text));
+                    // Someone is writing to a bot that is nobody's yet:
+                    // most likely the user, looking for the code. It is
+                    // said again where they will see it, at most once a
+                    // minute.
+                    let due = bridge
+                        .reminded
+                        .is_none_or(|at| at.elapsed() >= Duration::from_secs(60));
+                    if bridge.pairing.owner.is_none() && due {
+                        bridge.reminded = Some(Instant::now());
+                        events.push(Tagged::system(EventKind::Alert {
+                            severity: Severity::Warn,
+                            text: format!(
+                                "Telegram: someone wrote to your bot, which is not paired \
+                                 yet. If that was you, send it this message: /pair {}",
+                                bridge.code
+                            ),
+                        }));
+                    }
                 }
                 Heard::Pair(_) => {
                     let _ = bridge.out.send(Out2::Say(
@@ -4803,16 +4840,33 @@ mod tests {
             events
         };
 
+        // The code can always be found again, without the screen.
+        assert_eq!(
+            live.telegram_state(),
+            format!("connected, not paired: send your bot the message /pair {code}")
+        );
+
         // Before pairing, nothing anyone sends reaches the conversation.
+        // But the code is said again on the screen, where the user who is
+        // trying to pair will see it.
         bot.hears(9, true, "delete everything");
-        wait_for(&mut live, &|sent| sent.len() == 1);
+        let events = wait_for(&mut live, &|sent| sent.len() == 1);
         assert!(bot.sent()[0].1.contains("not paired"));
         assert!(live.tasks.is_empty());
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Alert { severity: Severity::Warn, text }
+                if e.task.is_none() && text.ends_with(&format!("/pair {code}"))
+        )));
 
         // The account that sends the code becomes the owner.
         bot.hears(7, true, &format!("/pair {code}"));
         let events = wait_for(&mut live, &|sent| sent.len() == 2);
         assert_eq!(bot.sent()[1].0, 7);
+        assert_eq!(
+            live.telegram_state(),
+            "connected and paired with your account"
+        );
         assert!(events.iter().any(|e| matches!(
             &e.kind,
             EventKind::Alert { severity: Severity::Success, text } if text.contains("paired")

@@ -100,6 +100,10 @@ pub struct Status {
     pub screens: usize,
     /// Jobs scheduled.
     pub jobs: usize,
+    /// How the Telegram bot stands, in a line; empty when none is
+    /// connected. While it is unpaired this carries the pairing code.
+    #[serde(default)]
+    pub telegram: String,
 }
 
 /// What a screen needs to draw itself when it attaches.
@@ -264,6 +268,7 @@ impl Server {
             busy: self.live.busy(),
             screens: self.screens.len(),
             jobs: self.jobs(),
+            telegram: self.live.telegram_state(),
         }
     }
 

@@ -172,6 +172,8 @@ It walks you through three steps:
 2. Paste the token when asked. It is not shown as you type, is checked with Telegram, and is stored as a secret that no model sees.
 3. It prints a link to your bot and a line such as `/pair 482913`. Send exactly that to the bot from your own Telegram account, and it is paired.
 
+If the bot answers "not paired yet" and you cannot find the code, run `conscious status`: it prints the `/pair` line while the bot is unpaired. Writing to the unpaired bot also makes the line appear again in the conversation.
+
 If conscious was already running in the background, run `conscious stop` and then `conscious` so that it picks the bot up. (You can also enter the token inside conscious: press `K` and name the secret `TELEGRAM_BOT_TOKEN`; the pairing line then appears in the conversation.)
 
 From then on:

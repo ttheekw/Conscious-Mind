@@ -843,6 +843,9 @@ fn status_command() -> ExitCode {
                 s.screens,
                 s.jobs
             );
+            if !s.telegram.is_empty() {
+                println!("telegram {}", s.telegram);
+            }
             ExitCode::SUCCESS
         }
         None => {
