@@ -36,16 +36,26 @@ pub fn list_models() -> Vec<ModelInfo> {
     .collect()
 }
 
+/// The effort levels the Claude Code CLI takes.
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
 pub struct ClaudeCode {
     pub model: Option<String>,
+    /// How hard the model is asked to think (`low` … `max`), when set.
+    /// Written after the model in a spec: `claude-code:opus@high`.
+    pub effort: Option<String>,
     pub window: u32,
 }
 
 impl Provider for ClaudeCode {
     fn label(&self) -> String {
-        match &self.model {
+        let name = match &self.model {
             Some(m) => format!("claude-code:{m}"),
             None => "claude-code".into(),
+        };
+        match &self.effort {
+            Some(effort) => format!("{name}@{effort}"),
+            None => name,
         }
     }
 
@@ -71,6 +81,9 @@ impl Provider for ClaudeCode {
             .arg("--disable-slash-commands");
         if let Some(m) = &self.model {
             cmd.args(["--model", m]);
+        }
+        if let Some(effort) = &self.effort {
+            cmd.args(["--effort", effort]);
         }
 
         let mut parser = Parser::default();
@@ -253,6 +266,7 @@ mod tests {
         };
         let backend = ClaudeCode {
             model: None,
+            effort: None,
             window: 200_000,
         };
         let resp = backend.complete(&req, &mut |_| {}).unwrap();

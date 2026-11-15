@@ -292,10 +292,26 @@ pub fn from_spec(spec: &str) -> Result<Box<dyn Provider>, ProviderError> {
             .unwrap_or_else(|| default.to_string())
     };
     Ok(match backend {
-        "claude-code" | "claude" => Box::new(claude_code::ClaudeCode {
-            model: model.map(str::to_string),
-            window: window.unwrap_or(200_000),
-        }),
+        "claude-code" | "claude" => {
+            // `opus@high`: the model, then how hard it is asked to think.
+            let (name, effort) = match model.and_then(|m| m.split_once('@')) {
+                Some((name, effort)) => (Some(name).filter(|n| !n.is_empty()), Some(effort)),
+                None => (model, None),
+            };
+            if let Some(effort) = effort
+                && !claude_code::EFFORTS.contains(&effort)
+            {
+                return Err(ProviderError::Config(format!(
+                    "`{effort}` is not an effort level; use one of {}",
+                    claude_code::EFFORTS.join(", ")
+                )));
+            }
+            Box::new(claude_code::ClaudeCode {
+                model: name.map(str::to_string),
+                effort: effort.map(str::to_string),
+                window: window.unwrap_or(200_000),
+            })
+        }
         "codex" => Box::new(codex::Codex {
             model: model.map(str::to_string),
             window: window.unwrap_or(128_000),
@@ -532,6 +548,16 @@ mod tests {
     #[test]
     fn spec_selects_backend_and_model() {
         assert_eq!(from_spec("claude-code").unwrap().label(), "claude-code");
+        // A model, and after `@` how hard it is asked to think.
+        assert_eq!(
+            from_spec("claude-code:opus@high").unwrap().label(),
+            "claude-code:opus@high"
+        );
+        assert_eq!(
+            from_spec("claude-code:sonnet").unwrap().label(),
+            "claude-code:sonnet"
+        );
+        assert!(from_spec("claude-code:opus@furious").is_err());
         assert_eq!(
             from_spec("claude-code:sonnet").unwrap().label(),
             "claude-code:sonnet"

@@ -16,6 +16,12 @@ use std::time::Instant;
 use crate::provider::cli::{self, Login};
 use crate::provider::{self, Message, Request};
 
+/// The core model when Claude Code is chosen and the user named none: Opus
+/// asked to think hard (the user chose this, 2026-11-15). The CLI's own
+/// default is its most expensive model, which used up an allowance fast.
+/// `--model` or `CONSCIOUS_MODEL` still names any other.
+pub const CLAUDE_CORE: &str = "claude-code:opus@high";
+
 /// What `probe` found. Everything `judge` decides comes from here.
 #[derive(Clone, Debug)]
 pub struct Facts {
@@ -209,7 +215,7 @@ pub fn judge(facts: &Facts) -> Report {
 
     let mut ready = Vec::new();
     if usable(facts.claude) {
-        ready.push("claude-code".to_string());
+        ready.push(CLAUDE_CORE.to_string());
     }
     if usable(facts.codex) {
         ready.push("codex".to_string());
@@ -239,10 +245,10 @@ pub fn judge(facts: &Facts) -> Report {
         },
         None => {
             let pick = [
-                (facts.claude == Some(Login::Yes)).then(|| "claude-code".to_string()),
+                (facts.claude == Some(Login::Yes)).then(|| CLAUDE_CORE.to_string()),
                 (facts.codex == Some(Login::Yes)).then(|| "codex".to_string()),
                 facts.local.first().cloned(),
-                (facts.claude == Some(Login::Unknown)).then(|| "claude-code".to_string()),
+                (facts.claude == Some(Login::Unknown)).then(|| CLAUDE_CORE.to_string()),
                 (facts.codex == Some(Login::Unknown)).then(|| "codex".to_string()),
             ]
             .into_iter()
@@ -506,7 +512,7 @@ mod tests {
             codex: Some(Login::Yes),
             ..facts()
         });
-        assert_eq!(both.first_run_order(), ["claude-code", "codex"]);
+        assert_eq!(both.first_run_order(), [CLAUDE_CORE, "codex"]);
         assert_eq!(both.welcome(), both.welcome());
 
         // A named model is the only one tried first; the others follow.
@@ -542,8 +548,8 @@ mod tests {
             local: vec!["local:gemma".into()],
             ..facts()
         };
-        assert_eq!(judge(&all).core.as_deref(), Some("claude-code"));
-        assert_eq!(judge(&all).ready, ["claude-code", "codex", "local:gemma"]);
+        assert_eq!(judge(&all).core.as_deref(), Some(CLAUDE_CORE));
+        assert_eq!(judge(&all).ready, [CLAUDE_CORE, "codex", "local:gemma"]);
 
         // Installed is not enough: a signed-out backend is passed over.
         let signed_out = Facts {
@@ -570,7 +576,7 @@ mod tests {
             ..facts()
         };
         let report = judge(&unsure);
-        assert_eq!(report.core.as_deref(), Some("claude-code"));
+        assert_eq!(report.core.as_deref(), Some(CLAUDE_CORE));
         assert_eq!(level(&report, "Claude Code"), Level::Warn);
 
         let codex_sure = Facts {

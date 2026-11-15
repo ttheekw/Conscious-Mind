@@ -102,6 +102,8 @@ The script builds a release binary, copies it to `~/.local/bin/conscious`, and r
 
 `PREFIX=/some/dir ./install.sh` installs elsewhere. `./install.sh --uninstall` removes the command and keeps your data.
 
+**Which model it uses.** With Claude Code it uses Opus at high effort unless you say otherwise. To choose another, name it, with the effort after `@` if you want one: `conscious --model claude-code:sonnet@medium`. Setting `CONSCIOUS_MODEL` makes that the default. A model change needs `conscious stop` first, since the background process keeps the model it started with.
+
 **Without installing:** `cargo run` in the source folder does the same as `conscious`.
 
 **To try it with no model at all:** `conscious --demo`.
