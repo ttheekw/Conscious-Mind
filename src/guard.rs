@@ -507,6 +507,17 @@ impl Guard {
             // resolves to, redirects included.
             "browse" => match crate::web::check_address(text("url")) {
                 Err(why) => Verdict::Deny(why),
+                // An address can carry text out in what follows the page's
+                // own name. A model misled by something it read could put
+                // the user's words there, so such an address is the user's
+                // to allow even in trusted mode.
+                Ok(()) if carries_data(text("url")) => Verdict::Ask {
+                    risk: Risk::Medium,
+                    reason: format!(
+                        "loads {} . This address carries text after the page's own name, which is sent to that site: check it holds nothing of yours",
+                        text("url").trim()
+                    ),
+                },
                 Ok(()) if self.mode() == Mode::Trusted => Verdict::Allow(
                     "trusted mode: loads one public web page as text; only its address leaves this machine".into(),
                 ),
@@ -820,6 +831,13 @@ impl Guard {
     }
 }
 
+/// Whether a web address could carry more out than which page is wanted:
+/// it has a query or a fragment, or it is long enough to hold a message.
+pub fn carries_data(url: &str) -> bool {
+    let url = url.trim();
+    url.contains('?') || url.contains('#') || url.chars().count() > 120
+}
+
 /// Whether an environment variable is one a command must not be handed:
 /// its name says it holds a key, a token or a password, it reaches an
 /// agent that holds keys, or it is the harness's own.
@@ -1015,6 +1033,30 @@ mod tests {
                 ..
             }
         ));
+        // In trusted mode a plain page loads unasked, but an address that
+        // could carry text out with it still asks.
+        assert!(g.manage_access("set_mode", "trusted").0);
+        assert!(matches!(
+            g.check(
+                "browse",
+                &json!({"url": "https://example.com/docs/install"})
+            ),
+            Verdict::Allow(_)
+        ));
+        for carrying in [
+            "https://example.com/?q=the+user+said+their+bank+is",
+            "https://example.com/page#notes-from-the-conversation",
+            &format!("https://example.com/{}", "a".repeat(130)),
+        ] {
+            assert!(
+                matches!(
+                    g.check("browse", &json!({ "url": carrying })),
+                    Verdict::Ask { .. }
+                ),
+                "{carrying}"
+            );
+        }
+        assert!(g.manage_access("set_mode", "careful").0);
         for bad in [
             "http://localhost:3000/",
             "http://127.0.0.1/",

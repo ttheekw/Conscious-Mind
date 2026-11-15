@@ -24,6 +24,10 @@ use crate::web::{self, Browsed, Found, Page, Searched};
 
 /// Search phrases tried for one question.
 pub const MAX_QUERIES: usize = 3;
+/// The longest a search phrase may be. A search phrase leaves the machine,
+/// so it is kept to the size of a question: it must not be a way to carry
+/// a page of the user's own text out.
+pub const MAX_QUERY_CHARS: usize = 160;
 /// Pages read for one question.
 pub const MAX_PAGES: usize = 3;
 /// Passages from earlier research that make a web search unnecessary.
@@ -127,6 +131,11 @@ pub fn run(
         .collect();
     if queries.is_empty() {
         queries.push(question.clone());
+    }
+    for query in &mut queries {
+        if query.chars().count() > MAX_QUERY_CHARS {
+            *query = query.chars().take(MAX_QUERY_CHARS).collect();
+        }
     }
     let mut results: Vec<Vec<Found>> = Vec::new();
     for query in &queries {
