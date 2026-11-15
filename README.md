@@ -138,7 +138,8 @@ conscious check            # what this machine has, and which model would be use
 conscious telegram         # connect a Telegram bot and pair it with your account
 conscious status           # whether it is running in the background, and on what
 conscious stop [--force]   # end the background process
-conscious lessons          # what it has learned, and how each lesson has fared
+conscious lessons          # what it has learned, how each has fared, and whether it is private
+conscious lessons export   # only the general rules that may be shared
 conscious tuning           # the learned limits, and why each moved
 conscious policy           # the routing policy: version, history, rejected rewrites
 conscious selfupdate       # what it has tried to change in its own code
@@ -147,6 +148,15 @@ conscious --help           # everything else
 ```
 
 Your data (memory, timeline, skills, policy versions) is in `~/.local/share/conscious`.
+
+### What it remembers, and what stays private
+
+conscious keeps two kinds of memory, and treats them differently:
+
+- **About you and what you want**: who you are, how you like things done, what you meant by a request, what happened in your projects. This is private. It lives in `~/.local/share/conscious` on your machine and is in nothing that is exported or published.
+- **How the system itself should work to solve a problem**, whatever the request: general rules it drew for itself and has confirmed. These are about nobody, so they can be shared.
+
+Everything is private unless it is plainly of the second kind: a rule that names a project, a file, a value or a person is kept private. `conscious lessons` shows which each one is. `conscious lessons export` prints only the shareable rules, and `conscious lessons import FILE` takes rules from someone else's copy, which then have to prove themselves on your machine like any other.
 
 ### Secrets
 

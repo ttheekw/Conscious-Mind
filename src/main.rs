@@ -78,6 +78,8 @@ conscious telegram                 connect a Telegram bot: its token, then pairi
 conscious secrets [remove NAME]    the names of the secrets you have stored (enter one with K in the TUI)
 conscious skills                   the procedures the agent has written for itself
 conscious lessons                  the lessons it has drawn, whether each is confirmed, and how it has fared
+conscious lessons export           print the rules that may be shared: general ways of working, about nobody
+conscious lessons import FILE      take rules shared by another copy, unconfirmed until proved here
 conscious tuning                   the limits on what it learns: what each is now, and why it moved
 conscious knowledge ...            the knowledge graph: ingest, search, add, stats (run it for help)
 
@@ -317,6 +319,50 @@ fn main() -> ExitCode {
             .ok_or_else(|| "no home directory to keep memory in".to_string())
             .and_then(|dir| knowledge::KnowledgeBase::open(&dir));
         return match opened {
+            // Only what is about nobody: the general rules it has confirmed.
+            Ok(kb) if raw.get(1).is_some_and(|a| a == "export") => {
+                let rules = kb.shareable_rules();
+                if rules.is_empty() {
+                    eprintln!(
+                        "Nothing to share yet: a rule is shareable once it is confirmed, is \
+                         about how to work in general, and names no project or person."
+                    );
+                } else {
+                    println!("# Rules a copy of conscious drew for itself and confirmed.");
+                    println!(
+                        "# General ways of working only: nothing about a person or a project."
+                    );
+                    for rule in rules {
+                        println!("- {rule}");
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(mut kb) if raw.get(1).is_some_and(|a| a == "import") => {
+                let Some(file) = raw.get(2) else {
+                    eprintln!("usage: conscious lessons import FILE");
+                    return ExitCode::from(2);
+                };
+                match std::fs::read_to_string(file) {
+                    Ok(text) => {
+                        let (taken, known, refused) = kb.import_rules(&text);
+                        if let Err(e) = kb.commit() {
+                            eprintln!("error: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                        println!(
+                            "Took {taken} rule(s) as unconfirmed, to be proved here like any \
+                             other; {known} already known; {refused} refused (too long, or \
+                             about a project or a person)."
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error: {file}: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
             Ok(kb) => {
                 println!("{}", kb.lessons_report());
                 ExitCode::SUCCESS

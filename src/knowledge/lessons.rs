@@ -115,6 +115,73 @@ pub enum Learned<'a> {
     Intent { text: &'a str, when: &'a str },
 }
 
+/// Who may see something the harness has learned. There are two kinds of
+/// memory (the user set this out, 2026-11-15, after their name turned up
+/// where it should not have):
+///
+/// 1. **About the user and what they want**: who they are, how they like
+///    things done, what they meant by a request, what happened in their
+///    projects. This is theirs. It is `Private`: it stays on their machine
+///    and is in nothing that is exported or published.
+/// 2. **How the system itself should work to solve a problem**, whatever
+///    the request and whoever asks. This is not about anyone, and may be
+///    shared so that other copies of the harness start off knowing it. It
+///    is `Shareable`.
+///
+/// Everything is private unless it is plainly of the second kind, so a
+/// mistake errs towards keeping something back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Privacy {
+    Private,
+    Shareable,
+}
+
+impl Privacy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Privacy::Private => "private: about you or your work, stays on this machine",
+            Privacy::Shareable => "shareable: how the system works in general, about nobody",
+        }
+    }
+}
+
+/// Whether a statement speaks of a person: the user, or anyone addressed
+/// or named as one. Such a thing is about someone, so it is never shared.
+pub fn speaks_of_someone(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .any(|word| {
+            matches!(
+                word,
+                "user"
+                    | "user's"
+                    | "users"
+                    | "you"
+                    | "your"
+                    | "yours"
+                    | "i"
+                    | "my"
+                    | "me"
+                    | "he"
+                    | "she"
+                    | "his"
+                    | "her"
+                    | "him"
+                    | "their"
+                    | "they"
+                    | "them"
+                    | "name"
+                    | "named"
+                    | "owner"
+                    | "client"
+                    | "customer"
+                    | "boss"
+                    | "team"
+            )
+        })
+}
+
 /// Whether a statement is about one project, file or value rather than
 /// about how to work in general: it quotes a name, gives a path or a
 /// number, or speaks of "this project". Such a thing cannot be a rule for
@@ -208,6 +275,73 @@ impl KnowledgeBase {
             }
             _ => false,
         }
+    }
+
+    /// Who may see this memory. Only one thing is shareable: a rule the
+    /// agent drew for itself about how to work whatever the task, that has
+    /// been confirmed, is still in use, and names no project, file, value
+    /// or person. Who the user is, what they asked for, what they meant
+    /// (`Intent`), know-how for their kind of work, and every remembered
+    /// fact and event are private.
+    pub fn privacy(node: &Node) -> Privacy {
+        let general = Self::is_rule(node)
+            && node.retired.is_none()
+            && node.provenance.trust != Trust::Inferred
+            && !looks_specific(&node.text)
+            && !speaks_of_someone(&node.text);
+        if general {
+            Privacy::Shareable
+        } else {
+            Privacy::Private
+        }
+    }
+
+    /// The rules that may be shared, as plain statements, best supported
+    /// first. Nothing private is ever in this.
+    pub fn shareable_rules(&self) -> Vec<String> {
+        let mut rules: Vec<&Node> = self
+            .graph
+            .nodes()
+            .filter(|n| Self::privacy(n) == Privacy::Shareable)
+            .collect();
+        rules.sort_by_key(|n| std::cmp::Reverse((Self::support(n), n.id)));
+        rules
+            .into_iter()
+            .map(|n| {
+                n.text
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_start_matches("Rule: ")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Takes rules shared by another copy of the harness, one a line (a
+    /// leading `- ` is allowed). Each comes in as a rule of the agent's own
+    /// that nothing has confirmed yet, so it has to earn its place here
+    /// like any other; one that names a project, a value or a person is
+    /// not a general rule and is refused. Returns (taken, already known,
+    /// refused).
+    pub fn import_rules(&mut self, text: &str) -> (usize, usize, usize) {
+        let (mut taken, mut known, mut refused) = (0, 0, 0);
+        for line in text.lines() {
+            let rule = line.trim().trim_start_matches("- ").trim();
+            if rule.is_empty() || rule.starts_with('#') {
+                continue;
+            }
+            if looks_specific(rule) || speaks_of_someone(rule) {
+                refused += 1;
+                continue;
+            }
+            match self.add_learned(0, Learned::Rule(rule), true) {
+                Kept::New(_) => taken += 1,
+                Kept::Known(_) => known += 1,
+                Kept::Refused(_) => refused += 1,
+            }
+        }
+        (taken, known, refused)
     }
 
     /// Whether a lesson is a rule (how to behave whatever the task) rather
@@ -892,8 +1026,12 @@ impl KnowledgeBase {
                 (None, _) => "confirmed".to_string(),
             };
             out.push_str(&format!(
-                "#{} {kind}, {state} · drawn by {} task{} · given to {} task{} · rated good {}, bad {} · runs passed {}, failed {} · {}\n    {}\n",
+                "#{} {kind}, {state} · {} · drawn by {} task{} · given to {} task{} · rated good {}, bad {} · runs passed {}, failed {} · {}\n    {}\n",
                 n.id,
+                match Self::privacy(n) {
+                    Privacy::Private => "private",
+                    Privacy::Shareable => "shareable",
+                },
                 n.drawn_by.len(),
                 if n.drawn_by.len() == 1 { "" } else { "s" },
                 n.record.given,
@@ -933,6 +1071,91 @@ mod tests {
             Kept::New(id) | Kept::Known(id) => id,
             Kept::Refused(why) => panic!("refused: {why}"),
         }
+    }
+
+    #[test]
+    fn only_general_confirmed_rules_are_shareable_and_everything_about_the_user_is_private() {
+        let mut kb = KnowledgeBase::in_memory();
+        // The first kind: about the user and what they want.
+        let name = kb.remember("I am Ada", "Nice to meet you.", None);
+        let intent = match kb.add_learned(
+            1,
+            Learned::Intent {
+                text: "wants the answer in one sentence",
+                when: "asked a factual question",
+            },
+            true,
+        ) {
+            Kept::New(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let know_how = match kb.add_lesson(2, "the seed script needs the staging flag", true) {
+            Kept::New(id) => id,
+            other => panic!("{other:?}"),
+        };
+        // The second kind: how to work, whatever the task.
+        let new_rule = |kb: &mut KnowledgeBase, task: u32, text: &str| match kb.add_learned(
+            task,
+            Learned::Rule(text),
+            true,
+        ) {
+            Kept::New(id) => id,
+            other => panic!("{text}: {other:?}"),
+        };
+        let general = new_rule(&mut kb, 3, "read the failing test before changing the code");
+        let unproven = new_rule(&mut kb, 4, "run the whole suite after every change");
+        let about_user = new_rule(
+            &mut kb,
+            5,
+            "keep replies short because the user dislikes long ones",
+        );
+        // Rated good: confirmed.
+        for task in [1, 2, 3, 5] {
+            kb.rate_lessons(task, &[], true);
+        }
+
+        let privacy = |kb: &KnowledgeBase, id| KnowledgeBase::privacy(kb.node(id).unwrap());
+        assert_eq!(privacy(&kb, general), Privacy::Shareable);
+        for (what, id) in [
+            ("who the user is", name),
+            ("what the user meant", intent),
+            ("know-how from their work", know_how),
+            ("a rule nothing has confirmed", unproven),
+            ("a rule that speaks of the user", about_user),
+        ] {
+            assert_eq!(privacy(&kb, id), Privacy::Private, "{what}");
+        }
+        // Only the one general, confirmed rule is ever handed out.
+        assert_eq!(
+            kb.shareable_rules(),
+            ["read the failing test before changing the code"]
+        );
+        let exported = kb.shareable_rules().join("\n");
+        for private in ["Ada", "one sentence", "staging", "user"] {
+            assert!(!exported.contains(private), "{private} was exported");
+        }
+        // The report says which each is.
+        let report = kb.lessons_report();
+        assert_eq!(report.matches(" · shareable · ").count(), 1, "{report}");
+
+        // A retired rule is no longer shared.
+        kb.rate_lessons(3, &[], false);
+        kb.rate_lessons(3, &[], false);
+        assert!(kb.shareable_rules().is_empty());
+
+        // Rules shared by another copy come in unconfirmed, and anything
+        // about a project or a person is refused at the door.
+        let mut other = KnowledgeBase::in_memory();
+        let (taken, known, refused) = other.import_rules(
+            "# shared rules\n\
+             - read the failing test before changing the code\n\
+             - Read the failing test before changing the code.\n\
+             - always tell Ada's boss when the build fails\n\
+             - the config lives in conf.d/90-local.ini\n",
+        );
+        assert_eq!((taken, known, refused), (1, 1, 2));
+        // Unconfirmed here, so not passed on again until it proves itself.
+        assert!(other.shareable_rules().is_empty());
     }
 
     #[test]

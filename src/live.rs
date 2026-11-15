@@ -375,7 +375,11 @@ fn memory_node(kb: &KnowledgeBase, id: NodeId, label: String, kind: MemKind) -> 
                 crate::knowledge::Trust::Verified => "verified",
             };
             let record = &node.record;
-            let mut about = format!("{trust} · {}", KnowledgeBase::origin(node));
+            let mut about = format!(
+                "{trust} · {} · {}",
+                KnowledgeBase::origin(node),
+                KnowledgeBase::privacy(node).label()
+            );
             if record.given > 0 {
                 about.push_str(&format!(
                     " · given to {} task{}",
