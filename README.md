@@ -188,7 +188,8 @@ If conscious was already running in the background, run `conscious stop` and the
 
 From then on:
 
-- **Messages.** What you send the bot is said to main. Main's replies, and the results of its branches, come back to you there.
+- **Messages.** What you send the bot is said to main. Main's replies, and the results of its branches, come back to you there, rewritten for a phone: plain text with no markdown, and as short as they can be. The full reply stays on the screen.
+- **Seen and typing.** Your message gets an eyes reaction as soon as conscious has it (a bot cannot set Telegram's read ticks), and the chat shows "typing…" for as long as it is working.
 - **Approvals.** When a call needs your approval, the bot sends it with **Approve** and **Deny** buttons. Pressing one decides it, the same as at the screen, and the message then shows what was decided.
 - **Photos, video, audio, voice notes and files.** Send one (up to 20 MB, Telegram's limit for bots) and it is saved in the project folder under `telegram-inbox/`, and main is told where it is and what you wrote with it. The models conscious uses take text only, so the agent can work on the file with its tools (convert it, read its metadata, run a script over it) but cannot look at a picture or listen to a recording.
 

@@ -152,6 +152,8 @@ struct Bridge {
     pending: HashMap<u32, String>,
     /// When the pairing code was last said again on the screen.
     reminded: Option<Instant>,
+    /// When "typing…" was last shown.
+    typed: Option<Instant>,
     /// Wrong pairing codes sent so far. At `PAIR_TRIES` the code is thrown
     /// away, so nobody can pair until a new one is issued at the screen.
     wrong: u32,
@@ -173,6 +175,13 @@ enum Out2 {
         tool: u32,
         text: String,
     },
+    /// One of the owner's messages is marked as seen.
+    Seen {
+        chat: i64,
+        message: i64,
+    },
+    /// "typing…" is shown while work goes on.
+    Typing(i64),
     /// A pressed button is acknowledged.
     Pressed {
         button: String,
@@ -191,6 +200,26 @@ impl Bridge {
         if let (Some(path), Ok(text)) = (&self.path, serde_json::to_string_pretty(&self.pairing)) {
             let _ = std::fs::write(path, text);
         }
+    }
+}
+
+/// A reply as it is sent to a phone: plain text, and as short as the
+/// cheapest model can make it without losing what matters. One that is
+/// already short and plain goes as it is; if the model cannot be reached,
+/// the reply goes with its markup taken out and nothing else changed.
+fn for_phone(router: &Router, text: &str) -> String {
+    use crate::telegram::{FOR_PHONE, already_brief, plain};
+    if already_brief(text) {
+        return plain(text);
+    }
+    let req = Request {
+        system: FOR_PHONE.to_string(),
+        messages: vec![Message::user(format!("<message>\n{text}\n</message>"))],
+        ..Default::default()
+    };
+    match router.cheapest().complete(&req, &mut |_| {}) {
+        Ok(resp) if !resp.text.trim().is_empty() => crate::guard::redact(&plain(&resp.text)),
+        _ => plain(text),
     }
 }
 
@@ -1405,6 +1434,7 @@ impl Live {
         }
         tagged.extend(self.telegram_heard());
         self.telegram_tell(&tagged);
+        self.telegram_typing();
         // Whatever the limits on what is learned have just changed is said,
         // so the learning can be seen.
         if !tagged.is_empty()
@@ -1734,6 +1764,16 @@ impl Live {
                         None => Ok(()),
                     },
                     Out2::Pressed { button, note } => sender.pressed(&button, &note),
+                    // Courtesies: if one cannot be sent it is not worth a
+                    // warning, least of all one every few seconds.
+                    Out2::Seen { chat, message } => {
+                        let _ = sender.seen(chat, message);
+                        Ok(())
+                    }
+                    Out2::Typing(chat) => {
+                        let _ = sender.typing(chat);
+                        Ok(())
+                    }
                 };
                 if let Err(why) = sent {
                     report.send(Update::Event(EventKind::Alert {
@@ -1762,6 +1802,7 @@ impl Live {
             bot: files,
             pending: HashMap::new(),
             reminded: None,
+            typed: None,
             wrong: 0,
             alive,
         });
@@ -1807,7 +1848,7 @@ impl Live {
                     locked = true;
                 }
             }
-            heard.push((message.chat, what));
+            heard.push((message.chat, message.message, what));
         }
         if !heard.is_empty() {
             bridge.save();
@@ -1824,10 +1865,17 @@ impl Live {
                 ),
             }));
         }
-        for (chat, what) in heard {
+        for (chat, message, what) in heard {
             let Some(bridge) = &mut self.telegram else {
                 break;
             };
+            // What the owner sent is marked as seen straight away, before
+            // any work on it starts.
+            if matches!(what, Heard::Say(_) | Heard::File { .. }) && message != 0 {
+                let _ = bridge.out.send(Out2::Seen { chat, message });
+                let _ = bridge.out.send(Out2::Typing(chat));
+                bridge.typed = Some(Instant::now());
+            }
             match what {
                 Heard::Nothing => {}
                 Heard::Reply(text) => {
@@ -1963,25 +2011,45 @@ impl Live {
         };
         // Anything secret is taken out before it leaves the machine.
         let clean = |text: &str| crate::guard::redact(text);
+        // Replies are written for the screen: long, and in markdown. For
+        // the phone each is made plain and as short as it can be, by the
+        // cheapest model, off this thread.
+        let brief = |text: String, out: &Sender<Out2>, router: &Arc<Router>| {
+            let (out, router) = (out.clone(), router.clone());
+            thread::spawn(move || {
+                let _ = out.send(Out2::Say(owner, for_phone(&router, &text)));
+            });
+        };
         for event in events {
             let item = match &event.kind {
                 EventKind::Message {
                     agent: Some(_),
                     text,
-                } if event.task == Some(MAIN) => Out2::Say(owner, clean(text)),
+                } if event.task == Some(MAIN) => {
+                    brief(clean(text), &bridge.out, &self.router);
+                    continue;
+                }
                 EventKind::Merged {
                     branch,
                     title,
                     result,
                     ok,
-                } => Out2::Say(
-                    owner,
-                    clean(&if *ok {
-                        format!("Branch #{branch} ({title}) has ended:\n\n{result}")
-                    } else {
-                        format!("Branch #{branch} ({title}) ended without an answer.")
-                    }),
-                ),
+                } => {
+                    if *ok {
+                        brief(
+                            clean(&format!(
+                                "Branch #{branch} ({title}) has ended. Its result:\n\n{result}"
+                            )),
+                            &bridge.out,
+                            &self.router,
+                        );
+                        continue;
+                    }
+                    Out2::Say(
+                        owner,
+                        format!("Branch #{branch} ({title}) ended without an answer."),
+                    )
+                }
                 EventKind::ToolRequested {
                     id,
                     tool,
@@ -2034,6 +2102,25 @@ impl Live {
                 _ => continue,
             };
             let _ = bridge.out.send(item);
+        }
+    }
+
+    /// Keeps "typing…" showing in the owner's chat for as long as anything
+    /// is being worked on.
+    fn telegram_typing(&mut self) {
+        let busy = self.busy();
+        let Some(bridge) = &mut self.telegram else {
+            return;
+        };
+        let Some(owner) = bridge.pairing.owner else {
+            return;
+        };
+        let due = bridge
+            .typed
+            .is_none_or(|at| at.elapsed() >= crate::telegram::TYPING_EVERY);
+        if busy && due {
+            bridge.typed = Some(Instant::now());
+            let _ = bridge.out.send(Out2::Typing(owner));
         }
     }
 
@@ -4633,6 +4720,9 @@ mod tests {
         settled: Mutex<Vec<(i64, String)>>,
         /// The note each pressed button was acknowledged with.
         notes: Mutex<Vec<String>>,
+        /// Messages marked as seen, and how often "typing…" was shown.
+        seen: Mutex<Vec<i64>>,
+        typing: AtomicU32,
         update: AtomicU32,
     }
 
@@ -4643,6 +4733,7 @@ mod tests {
                 chat: from,
                 from,
                 private,
+                message: 40 + i64::from(self.update.load(Ordering::Relaxed)),
                 text: text.into(),
                 media: None,
                 button: None,
@@ -4722,6 +4813,16 @@ mod tests {
 
         fn fetch(&self, _: &str) -> Result<(Vec<u8>, String), String> {
             Ok((b"image bytes".to_vec(), "photos/file_7.jpg".to_string()))
+        }
+
+        fn seen(&self, _: i64, message: i64) -> Result<(), String> {
+            self.seen.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn typing(&self, _: i64) -> Result<(), String> {
+            self.typing.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -4853,6 +4954,67 @@ mod tests {
             .collect();
         names.sort();
         Some(names)
+    }
+
+    /// A model that answers at length, in markdown, and rewrites a reply
+    /// for a phone when that is what it is asked.
+    struct Wordy;
+
+    impl Provider for Wordy {
+        fn label(&self) -> String {
+            "wordy".into()
+        }
+        fn context_window(&self) -> u32 {
+            8_000
+        }
+        fn complete(
+            &self,
+            req: &Request,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<Response, crate::provider::ProviderError> {
+            let reply = if req.system == crate::telegram::FOR_PHONE {
+                // Even if the small model slips some markup in.
+                "The build **passed**: 268 tests ran, none failed."
+            } else {
+                // Long enough to keep the task running for a moment.
+                thread::sleep(Duration::from_millis(40));
+                "## Build result\n\nThe build **passed**.\n\n| Check | Result |\n|---|---|\n| tests | 268 passed |\n| lint | clean |\n\n- `cargo fmt --check` was clean\n- nothing failed\n\nSee `target/` for the output, and say if you want the full log."
+            };
+            Scripted::ok("wordy", reply).complete(req, &mut |_| {})
+        }
+    }
+
+    #[test]
+    fn telegram_shows_seen_and_typing_and_gets_a_short_plain_reply_while_the_screen_keeps_markdown()
+    {
+        let bot = Arc::new(FakeBot::default());
+        let mut live = Live::new(single(Wordy));
+        live.poll();
+        live.connect_telegram(bot.clone(), None);
+        live.telegram.as_mut().unwrap().pairing.owner = Some(7);
+
+        bot.hears(7, true, "how did the build go?");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        while bot.sent().is_empty() {
+            assert!(Instant::now() < deadline, "no reply reached Telegram");
+            events.extend(live.poll());
+            thread::sleep(Duration::from_millis(3));
+        }
+        // The message was marked as seen, and "typing…" shown, before the
+        // answer came.
+        assert_eq!(bot.seen.lock().unwrap().len(), 1);
+        assert!(bot.typing.load(Ordering::Relaxed) >= 1);
+        // The phone gets one short plain message: no markup, no table.
+        let (chat, text) = bot.sent()[0].clone();
+        assert_eq!(chat, 7);
+        assert_eq!(text, "The build passed: 268 tests ran, none failed.");
+        // The screen still has the reply as it was written.
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Message { agent: Some(_), text }
+                if e.task == Some(MAIN) && text.starts_with("## Build result") && text.contains("| tests |")
+        )));
     }
 
     #[test]

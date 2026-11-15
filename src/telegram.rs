@@ -84,6 +84,8 @@ pub struct Incoming {
     pub chat: i64,
     pub from: i64,
     pub private: bool,
+    /// Telegram's id of the message, to mark it as seen; 0 for a button.
+    pub message: i64,
     /// The text, or a file's caption.
     pub text: String,
     pub media: Option<Media>,
@@ -268,6 +270,7 @@ pub fn parse_updates(answer: &Value) -> Vec<Incoming> {
                     chat: chat["id"].as_i64()?,
                     from: press["from"]["id"].as_i64()?,
                     private: chat["type"].as_str() == Some("private"),
+                    message: 0,
                     text: String::new(),
                     media: None,
                     button: Some(Button {
@@ -290,6 +293,7 @@ pub fn parse_updates(answer: &Value) -> Vec<Incoming> {
                 chat: message["chat"]["id"].as_i64()?,
                 from: message["from"]["id"].as_i64()?,
                 private: message["chat"]["type"].as_str() == Some("private"),
+                message: message["message_id"].as_i64().unwrap_or(0),
                 text: text.to_string(),
                 media,
                 button: None,
@@ -389,6 +393,51 @@ pub trait Bot: Send + Sync {
     fn pressed(&self, button: &str, note: &str) -> Result<(), String>;
     /// Fetches a file: its bytes, and the path Telegram keeps it under.
     fn fetch(&self, file: &str) -> Result<(Vec<u8>, String), String>;
+    /// Marks one of the owner's messages as seen. A bot cannot set
+    /// Telegram's own read ticks, so it reacts to the message instead.
+    fn seen(&self, chat: i64, message: i64) -> Result<(), String>;
+    /// Shows "typing…" in the chat. Telegram drops it after a few
+    /// seconds, so it is sent again for as long as work goes on.
+    fn typing(&self, chat: i64) -> Result<(), String>;
+}
+
+/// How often "typing…" is sent again while work goes on (Telegram shows
+/// it for about five seconds).
+pub const TYPING_EVERY: Duration = Duration::from_secs(4);
+
+/// What the cheapest model is asked, to turn a reply written for the
+/// screen into one for a phone.
+pub const FOR_PHONE: &str = "Rewrite the message below for a phone chat. Plain text only: no \
+    markdown, no headings, no bullet symbols, no code fences, no tables. Make it as short as \
+    it can be while keeping the outcome, every number, name and file path that matters, and \
+    any question or decision put to the reader. At most five short sentences. Reply with the \
+    rewritten message and nothing else.";
+
+/// Whether a reply is already fit for a phone as it stands: one short
+/// paragraph with no markup. Only then is the rewriting call skipped.
+pub fn already_brief(text: &str) -> bool {
+    let text = text.trim();
+    text.chars().count() <= 280
+        && text.lines().count() <= 3
+        && !["**", "`", "#", "|", "- ", "* ", "]("]
+            .iter()
+            .any(|mark| text.contains(mark))
+}
+
+/// A reply with its markup taken out, for a chat that shows markup as
+/// typed: emphasis marks, code ticks and heading marks go, links keep
+/// their words, and runs of blank lines become one.
+pub fn plain(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for row in crate::markdown::render(text, 100_000) {
+        let line: String = row.iter().map(|span| span.content.as_ref()).collect();
+        let line = line.trim_end().to_string();
+        if line.is_empty() && out.last().is_none_or(|last| last.is_empty()) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n").trim().to_string()
 }
 
 /// The real bot: Telegram's HTTPS API.
@@ -513,6 +562,28 @@ impl Bot for Api {
         .map(|_| ())
     }
 
+    fn seen(&self, chat: i64, message: i64) -> Result<(), String> {
+        self.call(
+            "setMessageReaction",
+            json!({
+                "chat_id": chat,
+                "message_id": message,
+                "reaction": [{"type": "emoji", "emoji": "👀"}],
+            }),
+            0,
+        )
+        .map(|_| ())
+    }
+
+    fn typing(&self, chat: i64) -> Result<(), String> {
+        self.call(
+            "sendChatAction",
+            json!({"chat_id": chat, "action": "typing"}),
+            0,
+        )
+        .map(|_| ())
+    }
+
     fn fetch(&self, file: &str) -> Result<(Vec<u8>, String), String> {
         let answer = self.call("getFile", json!({"file_id": file}), 0)?;
         let path = answer["result"]["file_path"]
@@ -551,6 +622,7 @@ mod tests {
             chat: from,
             from,
             private,
+            message: 1,
             text: text.into(),
             media: None,
             button: None,
@@ -771,6 +843,31 @@ mod tests {
         let code = new_code();
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn a_reply_for_the_screen_is_made_plain_for_a_phone() {
+        let reply = "## Result\n\nThe **build** passed: `cargo test` ran 268 tests.\n\n\n- see [the log](https://example.com/log)\n- nothing failed\n\n```sh\ncargo run\n```";
+        let shown = plain(reply);
+        for mark in ["**", "`", "##", "]("] {
+            assert!(!shown.contains(mark), "{mark} is still in:\n{shown}");
+        }
+        for kept in [
+            "Result",
+            "The build passed: cargo test ran 268 tests.",
+            "the log",
+            "nothing failed",
+            "cargo run",
+        ] {
+            assert!(shown.contains(kept), "{kept} is missing from:\n{shown}");
+        }
+        assert!(!shown.contains("\n\n\n"));
+        // What is already short and plain is left alone, and not rewritten.
+        assert!(already_brief("It is high tide."));
+        assert_eq!(plain("It is high tide."), "It is high tide.");
+        assert!(!already_brief(reply));
+        assert!(!already_brief(&"word ".repeat(80)));
+        assert!(!already_brief("The `config` file changed."));
     }
 
     #[test]
