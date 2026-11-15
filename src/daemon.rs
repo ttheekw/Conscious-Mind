@@ -178,6 +178,14 @@ pub fn bind(path: &Path) -> Result<UnixListener, String> {
     let _ = std::fs::remove_file(path);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
+        // The folder holds the conversation, memory and secrets, and for
+        // an instant the new socket has the default permissions: nobody
+        // but the user may enter the folder at all. (Not done to the
+        // shared runtime folder a long path falls back to, which the
+        // system already keeps private.)
+        if path.file_name().is_some_and(|name| name == "daemon.sock") {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let listener = UnixListener::bind(path).map_err(|e| format!("{}: {e}", path.display()))?;
     // Only the user may talk to it.

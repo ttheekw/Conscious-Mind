@@ -47,6 +47,10 @@ pub const WAIT_SECS: u32 = 25;
 const MESSAGE_CHARS: usize = 4_000;
 /// The largest file Telegram lets a bot fetch.
 pub const MAX_FILE: u64 = 20 * 1024 * 1024;
+/// Wrong pairing codes taken before pairing is locked. A code is six
+/// digits, so without this anyone who finds the bot could simply try them
+/// all, and the owner of the bot is the owner of an agent with a shell.
+pub const PAIR_TRIES: u32 = 5;
 /// Calls that are approved at the screen and nowhere else: they change
 /// what the agent itself may do.
 pub const SCREEN_ONLY: [&str; 2] = ["access", "adopt self-update"];
@@ -140,6 +144,11 @@ pub enum Heard {
     Reply(String),
     /// Not for this bot's owner: no answer at all.
     Nothing,
+}
+
+/// Whether a message is an attempt to pair (right code or wrong).
+pub fn tries_to_pair(message: &Incoming) -> bool {
+    message.button.is_none() && message.text.trim().starts_with("/pair")
 }
 
 /// What a button carries: which call, and the verdict.

@@ -623,7 +623,15 @@ impl Guard {
             };
         }
         if read_only(command) {
-            return Verdict::Allow("only reads".into());
+            // Looking is free inside the folders the user allowed, as it
+            // is for the file tools. A command that looks anywhere else
+            // (the user's other files, their shell history, a browser
+            // profile) is theirs to allow, sandbox or not: what it prints
+            // goes to the model.
+            return match self.reads_outside(command) {
+                Some((risk, reason)) => Verdict::Ask { risk, reason },
+                None => Verdict::Allow("only reads, inside the folders you allowed".into()),
+            };
         }
         if self.sandbox && local_build(command) {
             return Verdict::Allow(
@@ -676,8 +684,39 @@ impl Guard {
                 ),
             ));
         }
+        let (risk, why) = self.reaches_outside(command, &["/dev/null", "/tmp", "/usr", "/bin"])?;
+        Some((risk, format!("{why}, and no sandbox confines it")))
+    }
+
+    /// Why a command that only reads should still be put to the user: it
+    /// names, or may reach, a place outside the folders they allowed.
+    /// System folders that hold programs and settings, not anyone's own
+    /// files, are left free to look at.
+    fn reads_outside(&self, command: &str) -> Option<(Risk, String)> {
+        let (risk, why) = self.reaches_outside(
+            command,
+            &[
+                "/dev/null",
+                "/tmp",
+                "/usr",
+                "/bin",
+                "/lib",
+                "/lib64",
+                "/etc",
+                "/opt",
+                "/sys",
+            ],
+        )?;
+        Some((risk, format!("{why}; what it reads is given to the model")))
+    }
+
+    /// Whether a command names, or may reach, a place that is neither in
+    /// the allowed folders nor under one of `free`. Judged from its text.
+    fn reaches_outside(&self, command: &str, free: &[&str]) -> Option<(Risk, String)> {
         // The harness's own data and settings: what it may do is kept there.
-        if command.contains("conscious/")
+        if [".local/share/conscious", ".config/conscious"]
+            .iter()
+            .any(|own| command.contains(own))
             || self
                 .protected
                 .iter()
@@ -695,9 +734,7 @@ impl Guard {
         {
             return Some((
                 Risk::Medium,
-                format!(
-                    "uses `{how}`, so where it reaches cannot be told from its text, and no sandbox confines it"
-                ),
+                format!("uses `{how}`, so where it reaches cannot be told from its text"),
             ));
         }
         let folders = self.folders();
@@ -707,15 +744,11 @@ impl Guard {
             .find(|word| {
                 let path = Path::new(word);
                 !folders.iter().any(|f| path.starts_with(f))
-                    && !["/dev/null", "/tmp", "/usr", "/bin"]
-                        .iter()
-                        .any(|ok| path.starts_with(ok))
+                    && !free.iter().any(|ok| path.starts_with(ok))
             })?;
         Some((
             Risk::Medium,
-            format!(
-                "names `{outside}`, outside the folders you allowed, and no sandbox confines it"
-            ),
+            format!("names `{outside}`, outside the folders you allowed"),
         ))
     }
 
@@ -732,13 +765,27 @@ impl Guard {
                 .filter_map(|name| Some((name.clone(), store.get(&name)?)))
                 .collect()
         };
+        // This process's own environment may hold keys (a model backend's
+        // API key, an agent socket for SSH). A command has no business
+        // with them, and `env` would print them to the model, so they are
+        // taken out before the secrets it does name are put in.
+        let hidden: Vec<std::ffi::OsString> = std::env::vars_os()
+            .map(|(name, _)| name)
+            .filter(|name| sensitive_env(&name.to_string_lossy()))
+            .collect();
         if !self.sandbox {
             let mut cmd = Command::new("bash");
             cmd.arg("-c").arg(command).current_dir(&self.root);
+            for name in &hidden {
+                cmd.env_remove(name);
+            }
             cmd.envs(secrets);
             return cmd;
         }
         let mut cmd = Command::new("bwrap");
+        for name in &hidden {
+            cmd.env_remove(name);
+        }
         cmd.envs(secrets);
         cmd.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
             .args(["--tmpfs", "/tmp"]);
@@ -771,6 +818,27 @@ impl Guard {
         cmd.args(["bash", "-c", command]);
         cmd
     }
+}
+
+/// Whether an environment variable is one a command must not be handed:
+/// its name says it holds a key, a token or a password, it reaches an
+/// agent that holds keys, or it is the harness's own.
+pub fn sensitive_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "AUTH",
+        "COOKIE",
+    ]
+    .iter()
+    .any(|word| upper.contains(word))
+        || upper.starts_with("CONSCIOUS_")
+        || upper == "GPG_AGENT_INFO"
 }
 
 /// Whether bubblewrap is installed and allowed to make a sandbox here.
@@ -1384,6 +1452,85 @@ mod tests {
         assert_eq!(
             redact("the token is tok-guard-0123456789."),
             "the token is [secret GUARD_TEST_TOKEN]."
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn looking_outside_the_allowed_folders_asks_and_a_command_is_not_handed_this_process_s_keys() {
+        let (g, root) = guard();
+        let inside = g.root.join("src/lib.rs").display().to_string();
+        // Inside the folder, and in system folders, looking is free.
+        for free in [
+            "cat src/lib.rs",
+            "ls -la",
+            "grep -rn fn src | head",
+            "env",
+            "cat /etc/os-release",
+            "ls /usr/lib",
+            &format!("cat {inside}"),
+        ] {
+            let verdict = shell(&g, free);
+            assert!(matches!(verdict, Verdict::Allow(_)), "{free}: {verdict:?}");
+        }
+        // Anywhere else is the user's to allow, with or without a sandbox
+        // and in either mode: what is read goes to the model.
+        for mode in ["careful", "trusted"] {
+            assert!(g.manage_access("set_mode", mode).0);
+            for outside in [
+                "cat ~/.bash_history",
+                "cat $HOME/.gitconfig",
+                "ls /home/someone/Documents",
+                "cat ../other-project/notes.txt",
+                "grep -r password /var/lib",
+                "cat /proc/1/environ",
+            ] {
+                let verdict = shell(&g, outside);
+                assert!(
+                    matches!(verdict, Verdict::Ask { .. }),
+                    "{mode}: {outside}: {verdict:?}"
+                );
+            }
+            // The harness's own data most of all.
+            assert!(matches!(
+                shell(&g, "cat ~/.local/share/conscious/access.json"),
+                Verdict::Ask {
+                    risk: Risk::High,
+                    ..
+                }
+            ));
+        }
+        // A project that happens to be called conscious is still a project.
+        let own = g.root.join("conscious/src/main.rs").display().to_string();
+        assert!(matches!(
+            shell(&g, &format!("cat {own}")),
+            Verdict::Allow(_)
+        ));
+
+        // Which variables a command is not given.
+        for hidden in [
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "SSH_AUTH_SOCK",
+            "CONSCIOUS_KNOWLEDGE_FILE",
+            "npm_config_authtoken",
+        ] {
+            assert!(sensitive_env(hidden), "{hidden}");
+        }
+        for kept in ["PATH", "HOME", "LANG", "TERM", "CARGO_HOME", "USER", "PWD"] {
+            assert!(!sensitive_env(kept), "{kept}");
+        }
+        // PATH is in this test's own environment, and stays; nothing the
+        // command is given has a sensitive name unless it asked for a
+        // stored secret by name.
+        let cmd = g.shell("env", false);
+        assert!(
+            cmd.get_envs().all(|(name, value)| {
+                value.is_none() || !sensitive_env(&name.to_string_lossy())
+            })
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

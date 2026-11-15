@@ -1071,6 +1071,7 @@ fn telegram_setup() -> bool {
          Waiting up to 3 minutes for it (Ctrl-C to stop waiting)..."
     );
     let deadline = Instant::now() + Duration::from_secs(180);
+    let mut wrong = 0;
     while Instant::now() < deadline {
         let (messages, last) = match api.updates(pairing.after, 10) {
             Ok(got) => got,
@@ -1081,6 +1082,21 @@ fn telegram_setup() -> bool {
         };
         pairing.after = pairing.after.max(last);
         for message in messages {
+            // A few wrong codes end the wait: six digits must not be
+            // something anyone who finds the bot can try one by one.
+            if telegram::tries_to_pair(&message)
+                && !matches!(telegram::hear(&pairing, &code, &message), Heard::Pair(_))
+            {
+                wrong += 1;
+                if wrong >= telegram::PAIR_TRIES {
+                    pairing.save(&path);
+                    println!(
+                        "FAIL  {wrong} wrong pairing codes were sent to the bot, so this code is \
+                         withdrawn. Run `conscious telegram` again for a new one.\n"
+                    );
+                    return false;
+                }
+            }
             match telegram::hear(&pairing, &code, &message) {
                 Heard::Pair(owner) => {
                     pairing.owner = Some(owner);

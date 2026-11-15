@@ -147,14 +147,43 @@ pub fn check_address(url: &str) -> Result<(), String> {
     }
 }
 
+/// Looks a host up for the connection itself and refuses any answer that
+/// is not a public address. `allowed` checks a name before the request,
+/// but a name can be made to answer differently the second time it is
+/// asked (DNS rebinding): a public address for the check, this machine for
+/// the connection. Checking the addresses actually connected to closes
+/// that.
+#[derive(Debug, Default)]
+struct PublicOnly(ureq::unversioned::resolver::DefaultResolver);
+
+impl ureq::unversioned::resolver::Resolver for PublicOnly {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let found = self.0.resolve(uri, config, timeout)?;
+        if found.iter().all(|addr| public(addr.ip())) {
+            Ok(found)
+        } else {
+            Err(ureq::Error::HostNotFound)
+        }
+    }
+}
+
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_global(Some(Duration::from_secs(30)))
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        PublicOnly::default(),
+    )
 }
 
 /// What an address answered with, once its redirects were followed.
@@ -921,6 +950,24 @@ pub fn fetch(url: &str) -> Result<Page, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_connection_itself_refuses_an_address_that_is_not_public() {
+        // Whatever a name was checked as, what it resolves to when the
+        // connection is made is checked again, so a name cannot answer
+        // "public" for the check and "this machine" for the request.
+        for local in [
+            "http://127.0.0.1:9/",
+            "http://localhost:9/",
+            "http://[::1]:9/",
+        ] {
+            let got = agent().get(local).call();
+            assert!(
+                matches!(got, Err(ureq::Error::HostNotFound)),
+                "{local}: {got:?}"
+            );
+        }
+    }
 
     #[test]
     fn only_public_web_addresses_are_allowed() {

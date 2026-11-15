@@ -152,6 +152,9 @@ struct Bridge {
     pending: HashMap<u32, String>,
     /// When the pairing code was last said again on the screen.
     reminded: Option<Instant>,
+    /// Wrong pairing codes sent so far. At `PAIR_TRIES` the code is thrown
+    /// away, so nobody can pair until a new one is issued at the screen.
+    wrong: u32,
     /// Cleared when the bridge goes, so its reader thread ends.
     alive: Arc<AtomicBool>,
 }
@@ -1629,6 +1632,11 @@ impl Live {
             Some(bridge) if bridge.pairing.owner.is_some() => {
                 "connected and paired with your account".into()
             }
+            Some(bridge) if bridge.code.is_empty() => {
+                "connected, pairing locked after too many wrong codes: run `conscious stop`, \
+                 then `conscious`, for a new code"
+                    .into()
+            }
             Some(bridge) => format!(
                 "connected, not paired: send your bot the message /pair {}",
                 bridge.code
@@ -1754,6 +1762,7 @@ impl Live {
             bot: files,
             pending: HashMap::new(),
             reminded: None,
+            wrong: 0,
             alive,
         });
         vec![Tagged::system(EventKind::Alert {
@@ -1779,11 +1788,24 @@ impl Live {
         // which needs the rest of the feed.
         let messages: Vec<_> = bridge.heard.try_iter().collect();
         let mut heard = Vec::new();
+        let mut locked = false;
         for message in messages {
             bridge.pairing.after = bridge.pairing.after.max(message.update);
             let what = crate::telegram::hear(&bridge.pairing, &bridge.code, &message);
             if let Heard::Pair(owner) = &what {
                 bridge.pairing.owner = Some(*owner);
+            }
+            // A wrong code counts. After a few the code is thrown away:
+            // six digits could otherwise simply be tried one by one.
+            if bridge.pairing.owner.is_none()
+                && !bridge.code.is_empty()
+                && crate::telegram::tries_to_pair(&message)
+            {
+                bridge.wrong += 1;
+                if bridge.wrong >= crate::telegram::PAIR_TRIES {
+                    bridge.code.clear();
+                    locked = true;
+                }
             }
             heard.push((message.chat, what));
         }
@@ -1791,6 +1813,17 @@ impl Live {
             bridge.save();
         }
         let mut events = Vec::new();
+        if locked {
+            events.push(Tagged::system(EventKind::Alert {
+                severity: Severity::Warn,
+                text: format!(
+                    "Telegram: {} wrong pairing codes were sent to your bot, so pairing is \
+                     locked and the code no longer works. If that was not you, someone is \
+                     guessing. For a new code run `conscious stop`, then `conscious`.",
+                    crate::telegram::PAIR_TRIES
+                ),
+            }));
+        }
         for (chat, what) in heard {
             let Some(bridge) = &mut self.telegram else {
                 break;
@@ -1798,15 +1831,20 @@ impl Live {
             match what {
                 Heard::Nothing => {}
                 Heard::Reply(text) => {
-                    let _ = bridge.out.send(Out2::Say(chat, text));
-                    // Someone is writing to a bot that is nobody's yet:
-                    // most likely the user, looking for the code. It is
-                    // said again where they will see it, at most once a
-                    // minute.
+                    // To the owner, always. To someone writing to a bot
+                    // that is nobody's yet, at most once a minute, and not
+                    // at all once pairing is locked: a stranger must not be
+                    // able to make it send without end.
+                    let unpaired = bridge.pairing.owner.is_none();
                     let due = bridge
                         .reminded
                         .is_none_or(|at| at.elapsed() >= Duration::from_secs(60));
-                    if bridge.pairing.owner.is_none() && due {
+                    if !unpaired || (due && !bridge.code.is_empty()) {
+                        let _ = bridge.out.send(Out2::Say(chat, text));
+                    }
+                    // Most likely it is the user, looking for the code: it
+                    // is said again where they will see it.
+                    if unpaired && due && !bridge.code.is_empty() {
                         bridge.reminded = Some(Instant::now());
                         events.push(Tagged::system(EventKind::Alert {
                             severity: Severity::Warn,
@@ -4862,6 +4900,37 @@ mod tests {
             EventKind::Alert { severity: Severity::Warn, text }
                 if e.task.is_none() && text.ends_with(&format!("/pair {code}"))
         )));
+
+        // Guessing the code gets nowhere: a few wrong ones lock pairing,
+        // after which even the right code does nothing.
+        let locked_bot = Arc::new(FakeBot::default());
+        let mut guessed = Live::new(single(Fixed("ok")));
+        guessed.poll();
+        guessed.connect_telegram(locked_bot.clone(), None);
+        let real = guessed.telegram.as_ref().unwrap().code.clone();
+        for n in 0..crate::telegram::PAIR_TRIES {
+            let wrong = format!("{:06}", (real.parse::<u32>().unwrap() + 1 + n) % 1_000_000);
+            locked_bot.hears(9, true, &format!("/pair {wrong}"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut said = Vec::new();
+        while !guessed.telegram_state().contains("pairing locked") {
+            assert!(Instant::now() < deadline, "pairing was not locked");
+            said.extend(guessed.poll());
+            thread::sleep(Duration::from_millis(3));
+        }
+        assert!(said.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Alert { severity: Severity::Warn, text } if text.contains("pairing is locked")
+        )));
+        locked_bot.hears(9, true, &format!("/pair {real}"));
+        for _ in 0..40 {
+            guessed.poll();
+            thread::sleep(Duration::from_millis(3));
+        }
+        assert!(guessed.telegram.as_ref().unwrap().pairing.owner.is_none());
+        // And a stranger cannot make the bot send without end.
+        assert!(locked_bot.sent().len() <= 1, "{:?}", locked_bot.sent());
 
         // The account that sends the code becomes the owner.
         bot.hears(7, true, &format!("/pair {code}"));
