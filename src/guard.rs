@@ -455,6 +455,16 @@ impl Guard {
             "plan" => Verdict::Allow("records the plan; changes nothing".into()),
             "recall" => Verdict::Allow("reads the harness's own memory".into()),
             "remember" => Verdict::Allow("adds a note to the harness's own memory".into()),
+            // Retiring a memory keeps it on record and only stops it being
+            // found, so it is allowed like writing one.
+            "forget" => Verdict::Allow(
+                "takes a note in the harness's own memory out of use; it stays on record".into(),
+            ),
+            // Only saves a file for the user to read and run themselves.
+            // The harness never runs it, and no command may name it.
+            "user_script" => Verdict::Allow(
+                "saves a script for you to run yourself; the harness never runs it".into(),
+            ),
             "skill" => Verdict::Allow("reads or writes the agent's own skills".into()),
             "delegate" => {
                 Verdict::Allow("starts a sub-agent, which works under these same guardrails".into())
@@ -610,6 +620,13 @@ impl Guard {
         }
         if let Some(bad) = FORBIDDEN.iter().find(|f| command.contains(*f)) {
             return Verdict::Deny(format!("`{}` is never run", bad.trim()));
+        }
+        // A script written for the user is the user's to run. If the agent
+        // could run it, it would be a way to run anything unseen.
+        if command.contains(crate::tools::USER_SCRIPTS) {
+            return Verdict::Deny(
+                "scripts written for the user are run by the user, never by a command".into(),
+            );
         }
         // Where the user's secrets are kept is never read by a command,
         // not even one that only looks.
@@ -1021,6 +1038,45 @@ mod tests {
 
     fn shell(g: &Guard, command: &str) -> Verdict {
         g.check("bash", &json!({ "command": command }))
+    }
+
+    #[test]
+    fn a_script_for_the_user_may_be_written_but_never_run_by_the_agent() {
+        let (g, root) = guard();
+        assert!(g.manage_access("set_mode", "trusted").0);
+        // Writing one is always allowed, even one full of `sudo`.
+        assert!(matches!(
+            g.check(
+                "user_script",
+                &json!({"name": "fix", "content": "#!/bin/sh\nsudo apt install bubblewrap"})
+            ),
+            Verdict::Allow(_)
+        ));
+        // Running it, by any route, is refused: it is the user's to run.
+        let script = std::env::temp_dir()
+            .join(crate::tools::USER_SCRIPTS)
+            .join("fix.sh")
+            .display()
+            .to_string();
+        for run in [
+            format!("sh {script}"),
+            format!("bash {script}"),
+            format!("cat {script} | head"),
+            format!("chmod +x {script} && {script}"),
+        ] {
+            assert!(matches!(shell(&g, &run), Verdict::Deny(_)), "{run}");
+        }
+        // `sudo` itself is still never run.
+        assert!(matches!(shell(&g, "sudo sysctl -w x=0"), Verdict::Deny(_)));
+        // Forgetting a memory is allowed like writing one.
+        assert!(matches!(
+            g.check(
+                "forget",
+                &json!({"about": "the pairing code is on the timeline"})
+            ),
+            Verdict::Allow(_)
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

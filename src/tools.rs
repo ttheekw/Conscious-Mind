@@ -44,6 +44,38 @@ impl Outcome {
 }
 
 /// The tools offered to the model.
+/// The folder scripts written for the user are kept in. No command the
+/// agent runs may name it (`Guard::check`), so a script written here can
+/// only ever be run by the user.
+pub const USER_SCRIPTS: &str = "conscious-scripts";
+
+/// Saves a script for the user to run themselves and returns its path.
+/// The name is reduced to letters, digits and dashes, so it cannot lead
+/// out of the scripts folder.
+pub fn save_user_script(name: &str, content: &str) -> Result<String, String> {
+    let name: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let name = name.trim_matches('-');
+    let name = if name.is_empty() { "script" } else { name };
+    let folder = std::env::temp_dir().join(USER_SCRIPTS);
+    std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    let path = folder.join(format!("{name}.sh"));
+    let mut text = content.replace("\r\n", "\n");
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(path.display().to_string())
+}
+
 pub fn specs() -> Vec<ToolSpec> {
     let spec = |name: &str, description: &str, properties: Value, required: &[&str]| ToolSpec {
         name: name.into(),
@@ -143,6 +175,21 @@ pub fn specs() -> Vec<ToolSpec> {
             &["text"],
         ),
         spec(
+            "forget",
+            "Take a memory out of use because it is wrong or no longer true: a fact, a note or a lesson that should not be found again. Say what it is about, close to its own wording. Use it when the user says something remembered is wrong, or when you saved something you should not have; do not leave a wrong memory in place and add a correction beside it.",
+            json!({"about": string("What the memory says, close to its own words")}),
+            &["about"],
+        ),
+        spec(
+            "user_script",
+            "Hand the user a shell script to run themselves, for anything you cannot or may not run: above all anything that needs `sudo`. The script is saved to a temporary file and you are given the one line the user should run. Use this instead of printing commands for the user to copy, and instead of refusing. The harness never runs the script.",
+            json!({
+                "name": string("A short name for the script, such as enable-sandbox"),
+                "content": string("The whole script, starting with #!/bin/sh and `set -e`, with a comment line saying what it does"),
+            }),
+            &["name", "content"],
+        ),
+        spec(
             "skill",
             "Your own procedures for kinds of task you have done before. `load` one that fits before starting; `save` a new one, or a corrected version under the same name, when you have worked out a reusable way of doing something; `list` shows them all.",
             json!({
@@ -240,6 +287,8 @@ pub fn describe(tool: &str, args: &Value) -> String {
         "bash" => text("command").to_string(),
         "recall" => text("query").to_string(),
         "remember" => text("text").to_string(),
+        "forget" => text("about").to_string(),
+        "user_script" => text("name").to_string(),
         "skill" => format!("{} {}", text("action"), text("name"))
             .trim()
             .to_string(),
@@ -568,6 +617,42 @@ mod tests {
     }
 
     #[test]
+    fn a_script_for_the_user_is_saved_whatever_it_says_and_cannot_leave_its_folder() {
+        // It may say `sudo`: it is text for the user to run, not a command
+        // the harness runs.
+        let script = "#!/bin/sh\nset -e\n# lets the sandbox work\nsudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0";
+        let name = format!("enable sandbox {}", std::process::id());
+        let path = save_user_script(&name, script).unwrap();
+        assert!(path.contains(USER_SCRIPTS), "{path}");
+        assert!(path.ends_with(&format!("enable-sandbox-{}.sh", std::process::id())));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{script}\n")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        std::fs::remove_file(&path).unwrap();
+        // A name cannot point anywhere else.
+        let odd = save_user_script("../../etc/cron.d/x", "#!/bin/sh\n").unwrap();
+        let folder = std::env::temp_dir().join(USER_SCRIPTS);
+        assert_eq!(
+            std::path::Path::new(&odd).parent().unwrap(),
+            folder.as_path(),
+            "{odd}"
+        );
+        std::fs::remove_file(&odd).unwrap();
+        assert!(
+            save_user_script("", "#!/bin/sh\n")
+                .unwrap()
+                .ends_with("script.sh")
+        );
+    }
+
+    #[test]
     fn every_tool_is_described_to_the_model_with_a_schema() {
         let names: Vec<String> = specs().into_iter().map(|s| s.name).collect();
         assert_eq!(
@@ -583,6 +668,8 @@ mod tests {
                 "access",
                 "recall",
                 "remember",
+                "forget",
+                "user_script",
                 "skill",
                 "schedule",
                 "research",

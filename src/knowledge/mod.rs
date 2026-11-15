@@ -734,6 +734,28 @@ impl KnowledgeBase {
         (!block.is_empty()).then_some((retrieval, block))
     }
 
+    /// Takes the memory that `about` describes out of use, and returns its
+    /// title. It is retired, not erased: it stays in the graph with the
+    /// reason and is never found again. Only a note is ever forgotten
+    /// (never the project's own text), and only when the lookup's best
+    /// match is a direct one, so a vague description forgets nothing.
+    pub fn forget(&mut self, about: &str) -> Option<String> {
+        let retrieval = self.retrieve(&Query::new(about));
+        let id = retrieval
+            .hits
+            .iter()
+            .filter(|h| h.hops == 0)
+            .map(|h| h.node)
+            .find(|id| {
+                self.graph
+                    .node(*id)
+                    .is_some_and(|n| n.kind == NodeKind::Note && n.retired.is_none())
+            })?;
+        let node = self.graph.node_mut(id)?;
+        node.retired = Some("forgotten on request: it was wrong or no longer true".into());
+        Some(node.title.clone())
+    }
+
     /// One line on what the store holds, for the start of a session.
     pub fn summary(&self) -> String {
         let s = self.stats();
@@ -811,6 +833,49 @@ mod tests {
             .iter()
             .map(|h| kb.node(h.node).unwrap().title.clone())
             .collect()
+    }
+
+    #[test]
+    fn a_wrong_memory_is_forgotten_and_never_found_again() {
+        let mut kb = KnowledgeBase::in_memory();
+        let wrong = kb.add_note(
+            MEMORY_SPACE,
+            "agent",
+            "The pairing code for the telegram bot is shown on the timeline.",
+        );
+        let other = kb.add_note(MEMORY_SPACE, "user", "The boat is kept in the old harbour.");
+        kb.commit().unwrap();
+        assert!(
+            kb.recall("where is the telegram pairing code shown", &[])
+                .is_some()
+        );
+
+        // Something vague forgets nothing.
+        assert_eq!(kb.forget("zebra crossing regulations"), None);
+        // Naming it does: it is retired, with the reason, and gone from
+        // every later lookup. Nothing else is touched.
+        let title = kb.forget("the pairing code for the telegram bot is shown on the timeline");
+        assert!(title.is_some_and(|t| t.contains("pairing code")));
+        kb.commit().unwrap();
+        assert!(
+            kb.node(wrong)
+                .unwrap()
+                .retired
+                .as_deref()
+                .unwrap()
+                .contains("forgotten")
+        );
+        assert!(kb.node(other).unwrap().retired.is_none());
+        assert!(
+            kb.recall("where is the telegram pairing code shown", &[])
+                .is_none()
+        );
+        assert!(kb.recall("where is the boat kept", &[]).is_some());
+        // Forgetting it twice finds nothing left to forget.
+        assert_eq!(
+            kb.forget("the pairing code for the telegram bot is shown on the timeline"),
+            None
+        );
     }
 
     #[test]

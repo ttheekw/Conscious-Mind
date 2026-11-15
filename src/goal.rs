@@ -156,8 +156,9 @@ pub fn read_criteria(reply: &str) -> Vec<String> {
 /// The criteria as a block for the working model's context.
 pub fn brief(criteria: &[String]) -> String {
     let mut s = String::from(
-        "How success on this task will be judged. Work until each of these holds, and in your \
-         final reply say briefly how each one stands:\n",
+        "How success on this task will be judged. Work until each of these holds. The \
+         harness checks them itself from the record of what you did, so do not recite them \
+         or report on them one by one in your reply:\n",
     );
     for c in criteria {
         s.push_str(&format!("- {c}\n"));
