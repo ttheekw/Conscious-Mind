@@ -435,11 +435,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    // The input box is three rows when empty and grows with what is typed,
+    // up to a third of the screen.
+    let input_h = (input_text(app, area.width).len() as u16 + 1).clamp(3, (area.height / 3).max(3));
     let [header, body, signals, input] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(10),
         Constraint::Length(4),
-        Constraint::Length(1),
+        Constraint::Length(input_h),
     ])
     .areas(area);
 
@@ -2660,16 +2663,30 @@ fn render_signals(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Where a message will go, as the chip on the input box says it.
+fn input_target(app: &App) -> String {
+    match app.input_task.filter(|_| app.focus == Panel::Input) {
+        Some(id) => format!(" REPLY IN BRANCH #{id} "),
+        None => " TO MAIN ".to_string(),
+    }
+}
+
+/// What is typed, wrapped to the room beside the chip: long text goes on
+/// to further rows instead of running off the edge.
+fn input_text(app: &App, total: u16) -> Vec<String> {
+    let lead = chip_width(&input_target(app)) as usize + 4;
+    wrap(&app.input, (total as usize).saturating_sub(lead + 2))
+}
+
 fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Panel::Input;
     app.hits.panels.push((area, Panel::Input));
     let bg = if focused { SELECT } else { BAND };
+    f.render_widget(Block::new().style(Style::new().bg(bg)), area);
     // Says where the message will go before it is sent.
-    let target = match app.input_task.filter(|_| focused) {
-        Some(id) => format!(" REPLY IN BRANCH #{id} "),
-        None => " TO MAIN ".to_string(),
-    };
-    let mut spans = chip(
+    let target = input_target(app);
+    let lead = chip_width(&target) as usize + 4;
+    let mut first = chip(
         &target,
         if target.starts_with(" REPLY") {
             CYAN
@@ -2678,22 +2695,39 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
         },
         focused,
     );
-    spans.push(Span::styled(" ❯ ", bold(if focused { NEON } else { DIM })));
+    first.push(Span::styled(" ❯ ", bold(if focused { NEON } else { DIM })));
+    let mut lines: Vec<Line<'static>> = Vec::new();
     if app.input.is_empty() && !focused {
-        spans.push(Span::styled(
+        first.push(Span::styled(
             "i to type · it goes to main, which branches when it is real work",
             fg(DIM),
         ));
+        lines.push(Line::from(first));
     } else {
-        spans.push(Span::styled(app.input.clone(), fg(TEXT)));
+        // The text rows, keeping the last ones in view when there are
+        // more than fit: that is where the typing is.
+        let rows = area.height.saturating_sub(1).max(1) as usize;
+        let mut text = input_text(app, area.width);
         if focused {
-            spans.push(Span::styled(if blink(app) { "█" } else { " " }, fg(NEON)));
+            let cursor = if blink(app) { "█" } else { " " };
+            match text.last_mut() {
+                Some(last) => last.push_str(cursor),
+                None => text.push(cursor.to_string()),
+            }
+        }
+        let skipped = text.len().saturating_sub(rows);
+        for (i, row_text) in text.into_iter().skip(skipped).enumerate() {
+            let mut spans = if i == 0 && skipped == 0 {
+                std::mem::take(&mut first)
+            } else {
+                vec![Span::raw(" ".repeat(lead))]
+            };
+            spans.push(Span::styled(row_text, fg(TEXT)));
+            lines.push(Line::from(spans));
         }
     }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::new().bg(bg)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).style(Style::new().bg(bg)), area);
+    // The keys, on the box's last row.
     let hint = if focused {
         "⏎ send  ╱  esc leave "
     } else {
@@ -2702,7 +2736,7 @@ fn render_input(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width as usize > width(hint) + 44 {
         f.render_widget(
             Paragraph::new(Line::styled(hint, fg(DIM))).alignment(Alignment::Right),
-            area,
+            row(area, area.height.saturating_sub(1)),
         );
     }
 }

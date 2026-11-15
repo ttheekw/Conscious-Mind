@@ -324,6 +324,30 @@ fn a_secret_is_typed_into_its_own_window_and_never_drawn() {
 }
 
 #[test]
+fn the_input_box_is_tall_and_long_text_wraps_inside_it() {
+    let mut app = App::new(false);
+    key(&mut app, KeyCode::Char('i'));
+    let long = "please look through every module and tell me which ones have no tests at all, then write the missing ones starting with the smallest module and run the whole suite after each one so that nothing else breaks along the way ENDMARK";
+    for c in long.chars() {
+        key(&mut app, KeyCode::Char(c));
+    }
+    let screen = text(&render(&mut app));
+    // All of it is on screen, over several rows, none of it cut off.
+    assert!(
+        screen.contains("please look through every module"),
+        "{screen}"
+    );
+    assert!(screen.contains("ENDMARK"), "{screen}");
+    let rows: Vec<&str> = screen.lines().collect();
+    let first = rows
+        .iter()
+        .position(|r| r.contains("please look through"))
+        .unwrap();
+    let last = rows.iter().position(|r| r.contains("ENDMARK")).unwrap();
+    assert!(last > first, "the text did not wrap:\n{screen}");
+}
+
+#[test]
 fn clicking_a_tool_row_opens_its_details() {
     let (mut app, _demo) = at_gate();
     key(&mut app, KeyCode::Esc);
