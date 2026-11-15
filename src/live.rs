@@ -2379,6 +2379,25 @@ impl Live {
             tokens: instructions,
             why: "harness instructions (estimated size)".into(),
         }];
+        // The tools are described to the model in every call of an agent's
+        // run. They are a large part of what is sent, so they are shown.
+        if self.guard.is_some() {
+            let described: usize = crate::tools::specs()
+                .iter()
+                .filter(|t| {
+                    id != MAIN || !agent::MAIN_LEAVES_TO_BRANCHES.contains(&t.name.as_str())
+                })
+                .filter(|t| id == MAIN || t.name != "branch")
+                .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+                .sum();
+            sections.push(ContextSection {
+                name: "tools".into(),
+                tokens: (described / 4) as u32,
+                why: "what each tool is and how to call it, sent with every call so the \
+                      model can use them (estimated size)"
+                    .into(),
+            });
+        }
         if !project.is_empty() {
             sections.push(ContextSection {
                 name: "project".into(),
