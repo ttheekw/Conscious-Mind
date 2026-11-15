@@ -13,6 +13,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Instant;
 
+use crate::guard::SandboxState;
 use crate::provider::cli::{self, Login};
 use crate::provider::{self, Message, Request};
 
@@ -37,7 +38,7 @@ pub struct Facts {
     pub openrouter_key: bool,
     /// The data folder, or why it cannot be written.
     pub data: Result<String, String>,
-    pub sandbox: bool,
+    pub sandbox: SandboxState,
     pub terminal: bool,
 }
 
@@ -107,8 +108,52 @@ pub fn probe(named: Option<String>) -> Facts {
         openai_key: key_set("OPENAI_API_KEY"),
         openrouter_key: key_set("OPENROUTER_API_KEY"),
         data: data_folder(),
-        sandbox: crate::guard::sandbox_works(Path::new(".")),
+        sandbox: crate::guard::sandbox_state(
+            &std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf()),
+        ),
         terminal: std::io::stdout().is_terminal() && std::io::stdin().is_terminal(),
+    }
+}
+
+/// The Sandbox line for what bubblewrap did when tried.
+fn sandbox_check(state: &SandboxState) -> Check {
+    let (level, detail, fix) = match state {
+        SandboxState::Works => (
+            Level::Ok,
+            "shell commands run confined to the project, with no network".to_string(),
+            None,
+        ),
+        SandboxState::Missing => (
+            Level::Warn,
+            "bubblewrap is not installed; every shell command will ask first".to_string(),
+            Some("install it, e.g. `sudo apt install bubblewrap`".to_string()),
+        ),
+        SandboxState::Refused(why) => {
+            let blocked = why.contains("uid map")
+                || why.contains("RTM_NEWADDR")
+                || why.contains("namespace")
+                || why.contains("Permission denied")
+                || why.contains("Operation not permitted");
+            let fix = if blocked {
+                "the system blocks unprivileged user namespaces (on Ubuntu 24.04, AppArmor does). Allow /usr/bin/bwrap with an AppArmor profile containing `userns,`, or run `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`; installing bubblewrap again will not help"
+                    .to_string()
+            } else {
+                "run the bwrap command by hand to see why it refuses".to_string()
+            };
+            (
+                Level::Warn,
+                format!(
+                    "bubblewrap is installed but refused to start ({why}); every shell command will ask first"
+                ),
+                Some(fix),
+            )
+        }
+    };
+    Check {
+        name: "Sandbox",
+        level,
+        detail,
+        fix,
     }
 }
 
@@ -305,22 +350,7 @@ pub fn judge(facts: &Facts) -> Report {
             ),
         },
     });
-    checks.push(if facts.sandbox {
-        Check {
-            name: "Sandbox",
-            level: Level::Ok,
-            detail: "shell commands run confined to the project, with no network".into(),
-            fix: None,
-        }
-    } else {
-        Check {
-            name: "Sandbox",
-            level: Level::Warn,
-            detail: "bubblewrap is missing or not allowed; every shell command will ask first"
-                .into(),
-            fix: Some("install it, e.g. `sudo apt install bubblewrap`".into()),
-        }
-    });
+    checks.push(sandbox_check(&facts.sandbox));
     checks.push(if facts.terminal {
         Check {
             name: "Terminal",
@@ -486,9 +516,46 @@ mod tests {
             openai_key: false,
             openrouter_key: false,
             data: Ok("/data".into()),
-            sandbox: true,
+            sandbox: SandboxState::Works,
             terminal: true,
         }
+    }
+
+    fn sandbox_line(state: SandboxState) -> Check {
+        let f = Facts {
+            sandbox: state,
+            ..facts()
+        };
+        judge(&f)
+            .checks
+            .into_iter()
+            .find(|c| c.name == "Sandbox")
+            .unwrap()
+    }
+
+    #[test]
+    fn each_sandbox_state_gets_its_own_message_and_fix() {
+        let ok = sandbox_line(SandboxState::Works);
+        assert_eq!(ok.level, Level::Ok);
+        assert!(ok.fix.is_none());
+
+        let missing = sandbox_line(SandboxState::Missing);
+        assert_eq!(missing.level, Level::Warn);
+        assert!(missing.detail.contains("not installed"));
+        assert!(missing.fix.unwrap().contains("sudo apt install bubblewrap"));
+
+        let refused = sandbox_line(SandboxState::Refused(
+            "bwrap: setting up uid map: Permission denied".into(),
+        ));
+        assert_eq!(refused.level, Level::Warn);
+        assert!(refused.detail.contains("installed but refused to start"));
+        assert!(refused.detail.contains("uid map"));
+        let fix = refused.fix.unwrap();
+        assert!(fix.contains("userns,"));
+        assert!(fix.contains("apparmor_restrict_unprivileged_userns=0"));
+
+        let other = sandbox_line(SandboxState::Refused("bwrap: odd failure".into()));
+        assert!(!other.fix.unwrap().contains("AppArmor"));
     }
 
     fn level(report: &Report, name: &str) -> Level {
@@ -632,7 +699,7 @@ mod tests {
             claude: Some(Login::Unknown),
             codex: Some(Login::No),
             local: vec!["local:a".into(), "local:b".into()],
-            sandbox: false,
+            sandbox: SandboxState::Missing,
             terminal: false,
             data: Err("read-only".into()),
             ..facts()

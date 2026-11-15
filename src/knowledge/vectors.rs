@@ -80,8 +80,10 @@ impl Vectors {
             let node: NodeId = u64_of(take(8)?);
             let hash = u64_of(take(8)?);
             let vector = take(dim * 4)?
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             by_node.insert(node, (hash, vector));
         }

@@ -876,19 +876,56 @@ pub fn sensitive_env(name: &str) -> bool {
         || upper == "GPG_AGENT_INFO"
 }
 
-/// Whether bubblewrap is installed and allowed to make a sandbox here.
-pub fn sandbox_works(root: &Path) -> bool {
-    Command::new("bwrap")
+/// Whether bubblewrap can make a sandbox here, and if not, why.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SandboxState {
+    Works,
+    /// The `bwrap` program was not found.
+    Missing,
+    /// Installed, but it would not start; carries the first line of its error.
+    Refused(String),
+}
+
+impl SandboxState {
+    pub fn works(&self) -> bool {
+        matches!(self, SandboxState::Works)
+    }
+}
+
+/// Tries a real bubblewrap sandbox bound to `root` (made absolute first:
+/// bwrap fails with a relative bind path).
+pub fn sandbox_state(root: &Path) -> SandboxState {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let out = Command::new("bwrap")
         .args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
         .arg("--bind")
-        .arg(root)
-        .arg(root)
+        .arg(&root)
+        .arg(&root)
         .args(["--unshare-net", "--die-with-parent", "true"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => SandboxState::Works,
+        Ok(o) => SandboxState::Refused(first_line(&String::from_utf8_lossy(&o.stderr))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SandboxState::Missing,
+        Err(e) => SandboxState::Refused(e.to_string()),
+    }
+}
+
+/// The first non-empty line of bwrap's error output.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("it gave no reason")
+        .to_string()
+}
+
+/// Whether bubblewrap is installed and allowed to make a sandbox here.
+pub fn sandbox_works(root: &Path) -> bool {
+    sandbox_state(root).works()
 }
 
 fn looks_secret(path: &Path) -> bool {
