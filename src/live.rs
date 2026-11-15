@@ -2092,6 +2092,16 @@ impl Live {
                         ),
                     }
                 }
+                // What went wrong is said on the phone too: a task that
+                // stopped would otherwise just fall silent there. (Not the
+                // bridge's own trouble with Telegram, which could not be
+                // sent anyway and would only repeat itself.)
+                EventKind::Alert {
+                    severity: Severity::Error,
+                    text,
+                } if !text.starts_with("Telegram:") => {
+                    Out2::Say(owner, crate::telegram::plain(&clean(text)))
+                }
                 EventKind::SecretAsked { name, .. } => Out2::Say(
                     owner,
                     format!(
@@ -4954,6 +4964,38 @@ mod tests {
             .collect();
         names.sort();
         Some(names)
+    }
+
+    #[test]
+    fn a_task_that_stops_with_an_error_says_so_on_telegram_too() {
+        let bot = Arc::new(FakeBot::default());
+        let mut live = Live::new(single(Scripted {
+            label: "limited",
+            reply: Err("You've hit your 5-hour limit · resets 5am (UTC)"),
+        }));
+        live.poll();
+        live.connect_telegram(bot.clone(), None);
+        live.telegram.as_mut().unwrap().pairing.owner = Some(7);
+        bot.hears(7, true, "ok so");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bot.sent().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the error did not reach Telegram"
+            );
+            live.poll();
+            thread::sleep(Duration::from_millis(3));
+        }
+        let (chat, text) = bot.sent()[0].clone();
+        assert_eq!(chat, 7);
+        assert!(text.contains("5-hour limit"), "{text}");
+        // The bridge's own warnings about Telegram are not sent to Telegram.
+        live.telegram_tell(&[Tagged::system(EventKind::Alert {
+            severity: Severity::Error,
+            text: "Telegram: a message could not be sent: timeout".into(),
+        })]);
+        thread::sleep(Duration::from_millis(30));
+        assert!(bot.sent().iter().all(|(_, t)| !t.starts_with("Telegram:")));
     }
 
     /// A model that answers at length, in markdown, and rewrites a reply
