@@ -17,3 +17,7 @@ graphify-out/
 
 # Files sent to the agent over Telegram
 telegram-inbox/
+
+# Agent skills installed locally; not part of the project
+.agents/
+skills-lock.json
